@@ -1,13 +1,8 @@
-pyautogui>=0.9.54
-pydirectinput>=1.0.4; platform_system == "Windows"
-mss>=9.0.1
-Pillow>=10.0.0
-pyperclip>=1.8.2
-PyGetWindow>=0.0.9
+numpy
+opencv-python
 
-# Optional OCR. Install this if you want read_screen to understand Chinese well.
-# paddleocr>=2.7.0
-# paddlepaddle>=2.6.0
-
-# Optional lightweight OCR alternative. Requires the Tesseract app installed too.
-# pytesseract>=0.3.10
+# PaddleOCR 或 Tesseract：read_screen 的 OCR 引擎（二选一，惰性导入）；
+# 都不装时 read_screen 仍返回截图，只是 texts 里给一条"未安装 OCR 引擎"提示。
+# paddleocr
+# paddlepaddle
+# pytesseract

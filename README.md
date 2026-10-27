@@ -1,321 +1,280 @@
-# Sky PC MCP Companion
+# Sky ADB MCP 工具库
 
-一个给 PC 版《Sky: Children of the Light / 光遇》用的本地 MCP 小工具。它把本机窗口截图、OCR 读屏、键盘输入和聊天输入包装成 MCP/JSON-RPC tool，方便支持 MCP 或 HTTP tool 的 AI 客户端在局域网内做陪聊和本地实验。
+一个给《Sky: Children of the Light / 光遇》**安卓模拟器**用的本地 MCP 工具库。
+它把「模拟器截图、OCR 读屏、键盘输入、中文聊天」包装成 MCP / JSON-RPC tool，
+让任意支持 MCP 或 HTTP tool 的 AI 客户端来控制游戏里的角色。
+
+**本项目不包含决策逻辑**：没有 LLM 循环、没有人设、不替 AI 做任何决定。
+AI 客户端调用工具、自己决定该看哪里、按什么键、说什么话。
 
 ## 它做什么
 
-- 识别 PC 版光遇窗口
-- 截取游戏窗口并做 OCR
-- 返回截图或 OCR 文本
-- 发送键盘按键，例如 `w`、`space`、`f`、`q`、`enter`
-- 通过剪贴板向聊天框粘贴中文/英文消息
+- 识别并拉起模拟器里的光遇（国服 `com.netease.sky` / 国际服 `com.tgc.sky.android`）
+- 截取模拟器画面，可选 OCR 返回文字
+- 发送键盘按键（`w` / `a` / `s` / `d` / `space` / `f` / `q` / `enter` / `escape` / 方向键 / 数字键…），支持长按与组合键
+- 打开聊天框、输入中文/英文消息并发送（ADBKeyboard 输入法，无需剪贴板）
+- 前台守卫：游戏不在前台时拒绝按键，避免按键落进模拟器里的其他 App
 
-它不读游戏内存，不修改客户端，不破解协议，也不提供刷资源、代肝或自动跑图功能。请只把它当成本地可访问性/陪聊实验使用。
+它不读游戏内存，不修改客户端，不破解协议，也不提供刷资源、代肝或自动跑图功能。
+请只把它当作本地可访问性/陪聊实验使用。
+
+## 需要什么
+
+- Windows 电脑 + 安卓模拟器（本项目在 **MuMu 12 + 光遇国服** 上实测，其他模拟器/国际服理论通用）
+- [Android platform-tools](https://developer.android.com/tools/releases/platform-tools)（`adb`，加入 PATH 或设置 `ANDROID_HOME`）
+- **ADBKeyboard 输入法**（中文输入必需，见下）
+- Python 3.10+
+- 模拟器里光遇已登录、能自由行动
 
 ## 安装
 
-需要 Windows 和 Python 3.10 或更新版本。安装 Python 时建议勾选 “Add python.exe to PATH”。
-
-### 方式一：下载 ZIP（新手推荐）
-
-如果你之前没用过 Git，直接下载 ZIP 最简单：
-
-1. 打开 <https://github.com/Aevella/sky-pc-mcp-companion>
-2. 点绿色 `Code`
-3. 点 `Download ZIP`
-4. 解压到桌面或任意英文路径文件夹
-5. 进入解压后的 `sky-pc-mcp-companion` 文件夹
-6. 在文件夹空白处右键，选择“在终端中打开”或“Open in Terminal”
-7. 运行：
+### 1. Python 部分
 
 ```bat
 python -m pip install -r requirements.txt
 ```
 
-如果提示 `python` 不是命令，说明 Python 没装好或没加 PATH。重新安装 Python，并勾选 “Add python.exe to PATH”。
 
-### 方式二：使用 Git
+### 2. 装 ADBKeyboard（中文输入必需）
+
+安卓系统下没有 root 时，命令行很难把中文打进输入框。ADBKeyboard 是一个
+"专门接收 adb 广播、把文字直接塞进当前输入框"的输入法，稳定且无副作用。
+
+1. 下载 [`ADBKeyboard.apk`](https://github.com/senzhk/ADBKeyBoard)
+2. 装进模拟器：
+
+   ```bat
+   adb install -r ADBKeyboard.apk
+   adb shell ime enable com.android.adbkeyboard/.AdbIME
+   ```
+
+3. 不用手动设为默认输入法：server 第一次发消息时自动切换，Ctrl+C 退出时自动还原。
+
+验证：
 
 ```bat
-git clone https://github.com/Aevella/sky-pc-mcp-companion.git
-cd sky-pc-mcp-companion
-python -m pip install -r requirements.txt
+adb shell ime list -s
+:: 应该能看到 com.android.adbkeyboard/.AdbIME
 ```
 
-如果提示：
+### 3. 确认 adb 能看到模拟器
 
-```text
-git 不是内部或外部命令 / 无法将 "git" 识别为 cmdlet
+```bat
+adb devices -l
+:: 例: 127.0.0.1:16384  device product:r9q model:SM_G9900
 ```
 
-说明电脑没有安装 Git。可以改用上面的 ZIP 方式，或者安装 Git for Windows 后重新打开终端。
+MuMu 12 的 adb 端口常见是 `16384`，雷电 `5555`，蓝叠 `5555/5556`；
+有的模拟器需要在设置里手动打开「ADB 调试」。
 
-第一次启用 PaddleOCR 时可能会下载模型，等待完成即可。
+也可以先跑一次体检（设备/键盘节点/前台/输入法/截屏耗时都会列出来）：
+
+```bat
+python sky_adb.py doctor
+```
 
 ## 启动 HTTP MCP
 
-双击：
+```bat
+python sky-mcp-server.py --http
+```
+
+监听地址/端口/token 默认读 `sky_config.json`（样例见 `sky_config.example.json`），
+默认 `127.0.0.1:9900`、token `1234`。启动后日志会打印：
+
+```text
+[sky-mcp] HTTP 传输已启动: http://127.0.0.1:9900
+[sky-mcp] HTTP bearer token 已启用
+```
+
+局域网里的手机/其他客户端连接时，监听要改成 `0.0.0.0`：
 
 ```bat
-start-http.bat
+python sky-mcp-server.py --http --host 0.0.0.0
 ```
 
-窗口会显示类似：
+然后在客户端填：
 
 ```text
-URL:   http://0.0.0.0:9800
-Token: 一串随机 token
+URL:   http://运行服务那台电脑的局域网IP:9900
+Header: Authorization
+Value:  Bearer 1234
 ```
 
-手机或其他局域网客户端连接时，不要填 `0.0.0.0`，也不是填 GitHub 的地址。这里要填的是**运行 `start-http.bat` 那台电脑自己的局域网 IP**：
+`Bearer` 后面有一个英文空格。建议把 `sky_config.json` 里的 token 换成自己的随机值。
+用浏览器打开 `http://IP:9900/health` 能看到 `{"status":"ok"...}` 就说明网络通。
 
-```text
-http://192.168.1.23:9800
-```
-
-鉴权头：
-
-```text
-Authorization: Bearer 上面显示的Token
-```
-
-如果你的客户端把请求头拆成两格来填：
-
-```text
-Header name:  Authorization
-Header value: Bearer 上面显示的Token
-```
-
-注意：
-
-- `Bearer` 后面有一个英文空格。
-- 不要加引号，不要换行，不要把 `Token:` 这个标签一起复制进去。
-- `start-http.bat` 每次启动时如果没有设置 `SKY_MCP_TOKEN`，都会生成一串新的 token。重启过窗口就要复制当前窗口里最新的那一串。
-
-在运行 MCP 的那台 Windows 电脑上打开命令行，输入：
+查当前生效的配置（不会打印 token 明文）：
 
 ```bat
-ipconfig
+python sky_config.py
 ```
-
-找当前 Wi-Fi 或以太网下面的 `IPv4 地址`，通常长得像：
-
-```text
-192.168.x.x
-10.x.x.x
-172.16.x.x
-```
-
-例如查到 `IPv4 地址` 是 `192.168.1.23`，客户端里就填：
-
-```text
-http://192.168.1.23:9800
-```
-
-手机和电脑必须连在同一个 Wi-Fi / 同一个局域网里。
-
-### 测试连接报 HTTP 401
-
-如果客户端提示类似：
-
-```text
-HTTP 401 {"error": "missing or invalid bearer token"}
-```
-
-这说明手机已经连到这台电脑的 MCP 了，网络地址和端口大概率是通的；失败点在鉴权头。
-
-按顺序检查：
-
-1. 电脑上的 `start-http.bat` 窗口还开着，并且没有重启过。
-2. 客户端里的 URL 是电脑局域网 IP，例如 `http://192.168.1.23:9800`，不是 `0.0.0.0`。
-3. 自定义请求头名字是 `Authorization`。
-4. 自定义请求头内容是 `Bearer 当前窗口显示的Token`。
-5. 如果刚刚关闭又重新打开过 `start-http.bat`，复制新的 token。
-
-也可以先在手机浏览器打开：
-
-```text
-http://电脑局域网IP:9800/health
-```
-
-如果能看到 `{"status":"ok"...}`，说明网络通；此时连接 MCP 仍然 401，就是 token 或请求头没有填对。
-
-## 管理员模式
-
-如果光遇、Steam、启动器或游戏平台是“以管理员身份运行”的，这个 MCP 也要用管理员权限启动。否则 Windows 可能允许截图，但不允许普通权限的 Python 给管理员权限窗口发送按键。
-
-管理员启动方式：
-
-1. 右键 `start-http.bat`
-2. 选择“以管理员身份运行”
-3. 保持弹出的命令行窗口不要关闭
-
-如果右键 `.bat` 没有管理员选项，可以先用管理员权限打开命令提示符：
-
-```bat
-cd /d C:\path\to\sky-pc-mcp-companion
-start-http.bat
-```
-
-如果 `read_screen` / `screenshot` 正常，但 `press_key` 完全不动，优先试管理员模式。
 
 ## 本地 stdio MCP
 
-如果你的 MCP 客户端支持 stdio，可以使用：
-
-```bat
-start-stdio.bat
-```
-
-或直接配置：
+如果你的 MCP 客户端支持 stdio，直接在客户端配置里拉起：
 
 ```json
 {
   "command": "python",
-  "args": ["C:\\path\\to\\sky-pc-mcp-companion\\sky-mcp-server.py"]
+  "args": ["C:\\path\\to\\sky-mcp\\sky-mcp-server.py"]
 }
 ```
 
 ## 常用 tool
 
-### status
+工具清单与参数（stdio 与 HTTP 一致）：
 
-检查依赖、OCR、输入后端和窗口识别。
+| tool | 作用 | 主要参数 |
+|---|---|---|
+| `status` | 设备/输入法/前台/OCR/截图上限自检 | — |
+| `focus_game` | 唤醒屏幕并把光遇拉到前台（必要时拉起游戏） | — |
+| `press_key` | 按键，支持长按与组合键 | `key`、`duration_ms`、`backend`(adb/auto) |
+| `open_chat` | 短按聊天键（默认 `enter`）打开输入框/面板 | `key`、`duration_ms` |
+| `send_chat` | 打开聊天框 → 输入消息（中文可用）→ 发送 | `message`、`send`、`open_delay_ms`… |
+| `type_text` | 往**已经打开**的输入框打字，可选回车发送 | `message`、`send` |
+| `read_screen` | 截图 + OCR，返回文字与截图 | — |
+| `screenshot` | 只返回当前画面 PNG | — |
+
+示例（JSON-RPC `tools/call` 的 params 部分）：
+
+```json
+{"name": "status", "arguments": {}}
+{"name": "screenshot", "arguments": {}}
+{"name": "read_screen", "arguments": {}}
+{"name": "press_key", "arguments": {"key": "w", "duration_ms": 800}}
+{"name": "press_key", "arguments": {"key": "shift-space", "duration_ms": 80}}
+{"name": "open_chat", "arguments": {}}
+{"name": "type_text", "arguments": {"message": "你好", "send": true}}
+{"name": "send_chat", "arguments": {"message": "你好，我是本地 AI 陪聊测试"}}
+```
+
+按键语义（与光遇 PC 版一致，动作前请结合游戏 UI 状态判断）：
+
+| 键 | 有弹窗 | 面板开（无弹窗） | 都没有 |
+|---|---|---|---|
+| `escape` | 取消弹窗 | 退出输入态 | 游戏菜单（慎用） |
+| `space` | 确认所选 | 打开输入框 | 跳 |
+| `enter` | — | 打开输入框 | 打开面板+输入框 |
+| `f` | — | 对方伸手时=接受牵手；否则=交互/好友树 | 同左 |
+
+注意：
+
+- `backend` 只支持 `adb` / `auto`（本工具库只有 adb 一条执行路径）。
+- `press_key` 的 `duration_ms` 会被夹到 1~2000ms；移动/长按请给足时长。
+- 所有按键/输入都受前台守卫保护：游戏不在前台时返回错误（错误文本含「前台」），
+  客户端可以等用户切回游戏后重试。
+- 单条聊天消息上限 240 字符。
+- `send_chat` 会先清空输入框里的草稿再打字（光遇会记住没发出去的内容）。
+
+## 配置
+
+### sky_config.json — MCP 监听
+
+复制 `sky_config.example.json` 为 `sky_config.json`（已 gitignore）后按需改：
 
 ```json
 {
-  "name": "status",
-  "arguments": {}
+  "mcp": {"host": "127.0.0.1", "port": 9900, "token": "1234", "timeout": 30}
 }
 ```
 
-如果 `window` 是 `null`，说明没有找到游戏窗口。可以把游戏切到窗口化/无边框窗口化，或用真实窗口标题启动：
+| 字段 | 环境变量 | 说明 |
+|---|---|---|
+| `mcp.host` | `SKY_MCP_HOST` | 监听地址（局域网客户端用 `0.0.0.0`） |
+| `mcp.port` | `SKY_MCP_PORT` | 监听端口 |
+| `mcp.token` | `SKY_MCP_TOKEN` | HTTP bearer token |
+| `mcp.timeout` | `SKY_MCP_TIMEOUT` | 单次工具调用超时秒数 |
+
+优先级：环境变量 > `sky_config.json` > 内置默认值；命令行 `--host/--port/--token`
+可临时覆盖。`--config other.json` 可指定别的配置文件。
+
+### adb_config.json — 设备/采集（一般不用写）
+
+零配置即可跑（自动探测 adb / 设备 / 包名 / 键盘节点 / 输入法）。要覆盖时把
+`adb_config.example.json` 复制成 `adb_config.json`，或用环境变量：
+
+| 配置项 | 环境变量 | 说明 |
+|---|---|---|
+| `adb_path` | `SKY_ADB_PATH` | adb 可执行文件路径（默认 PATH / ANDROID_HOME） |
+| `serial` | `SKY_ADB_SERIAL` | 设备序列号，如 `127.0.0.1:16384`（多设备时必须） |
+| `package` | `SKY_GAME_PACKAGE` | 光遇包名（默认自动探测国服/国际服） |
+| `keyboard_device` | `SKY_KEYBOARD_DEVICE` | 键盘输入设备，如 `/dev/input/event4`（默认自动探测） |
+| `ime.component` | — | ADBKeyboard 输入法组件名 |
+| `ime.restore` | — | 退出时是否还原原输入法（默认 true） |
+| `verbose` | — | 打印每条 adb 命令 |
+
+## 一些踩坑换来的设计
+
+- **按键必须走 `sendevent`，不能用 `adb shell input keyevent`**。
+  实测：`input keyevent` 注入的事件光遇安卓版完全无视；直接往模拟器的
+  键盘设备写 Linux input 事件（`sendevent /dev/input/eventN 1 <code> 1/0`）
+  游戏会当成真实键盘，且按键语义与 PC 版完全一致。`sky_adb.py` 会自动从
+  `getevent -pl` 里找到那块"带全键盘"的设备（MuMu 通常是
+  `Xiaomi Input` → `/dev/input/event4`）。
+- **中文输入**：没有 root 时命令行无法直接输入 Unicode，所以走 ADBKeyboard
+  的 `ADB_INPUT_B64` 广播；每个字都从输入框提交，不经过剪贴板。
+- **前台守卫**：判断的是**安卓前台应用**（`mCurrentFocus`），不是 Windows 窗口：
+  模拟器窗口最小化/被挡住都照常工作，只有你在模拟器里切到别的 App 才会拦。
+- **按键安全**：单次按住封顶 2s；所有注入在同一把锁里，两个请求的 down/up 不会
+  交错；异常/退出时 `panic_release` 松开所有可能悬着的键。
+- **截图**：`adb exec-out screencap` 原生 RGBA（3200x1800 约 500ms/帧）；
+  装了 numpy/opencv 时转 PNG 很快，否则退回设备侧 PNG 编码（慢 5-8 倍）。
+
+## 常见问题
+
+- **HTTP 401**：客户端 URL 是局域网 IP（不是 `0.0.0.0`）；请求头名
+  `Authorization`、值 `Bearer 当前配置里的 token`；改过 token 记得重启服务。
+- **按键没反应**：先 `python sky_adb.py doctor` 看设备/键盘节点/前台；
+  再用 `python sky_adb.py key c --ms 150` 测一下聊天面板是否弹出
+  （不弹说明键盘设备选错了，在 `adb_config.json` 指定 `keyboard_device`）。
+- **发中文没反应**：ADBKeyboard 没装或没 `ime enable`；`sky_adb.py doctor`
+  里能看到状态。装了还不行就手动 `adb shell ime set com.android.adbkeyboard/.AdbIME`。
+- **`没有在线的 adb 设备`**：模拟器没开、没开 ADB 调试，或端口变了。
+  `adb devices -l` 先确认，必要时 `adb connect 127.0.0.1:16384`。
+- **多台 adb 设备**：给 server 加 `--adb-serial 127.0.0.1:16384`
+  （或环境变量 `SKY_ADB_SERIAL`）。
+- **输入法被切走**：server 正常退出（Ctrl+C）时会还原；异常退出可手动
+  `adb shell ime set <你原来的输入法>`（`ime list -s` 查看）。
+- **read_screen 没有 OCR 文本**：装 PaddleOCR 或 Tesseract；不装时仍返回截图。
+
+## 开发与测试
+
+单元测试全部用假 adb（`tests/fake_adb.py`），不需要模拟器：
 
 ```bat
-python sky-mcp-server.py --http --host 0.0.0.0 --port 9800 --token 你的token --window-title "窗口标题的一部分"
+python tests\run_all.py
 ```
 
-### read_screen
+目录：
 
-截图并 OCR 当前游戏窗口。
-
-```json
-{
-  "name": "read_screen",
-  "arguments": {}
-}
 ```
-
-### screenshot
-
-返回当前游戏窗口截图。
-
-```json
-{
-  "name": "screenshot",
-  "arguments": {}
-}
+sky_adb.py               adb 驱动（设备/截屏/按键/中文输入/前台，纯标准库）
+sky-mcp-server.py        MCP 工具库（stdio / HTTP JSON-RPC）
+sky_config.py            运行配置加载（端口/token）
+sky_config.example.json  配置样例
+adb_config.example.json  设备/采集配置样例
+tests/                   单元测试（假 adb）
 ```
-
-### press_key
-
-发送按键。移动测试建议先用长一点的按压时间。
-
-```json
-{
-  "name": "press_key",
-  "arguments": {
-    "key": "w",
-    "duration_ms": 800,
-    "backend": "pydirectinput"
-  }
-}
-```
-
-如果 `pydirectinput` 不动，可以试：
-
-```json
-{
-  "name": "press_key",
-  "arguments": {
-    "key": "w",
-    "duration_ms": 800,
-    "backend": "pyautogui"
-  }
-}
-```
-
-### send_chat
-
-打开聊天框、粘贴消息并发送。
-
-```json
-{
-  "name": "send_chat",
-  "arguments": {
-    "message": "你好，我是本地 AI 陪聊测试",
-    "backend": "pydirectinput"
-  }
-}
-```
-
-### type_text
-
-如果聊天框已经手动打开，可以只粘贴文本：
-
-```json
-{
-  "name": "type_text",
-  "arguments": {
-    "message": "测试中文输入",
-    "send": true,
-    "backend": "pydirectinput"
-  }
-}
-```
-
-## 能聚焦游戏，但不能输入文字
-
-如果 AI 客户端能把光遇窗口拉到前台，但发不出字，说明窗口识别和聚焦已经成功了，问题通常在“打开聊天框 / 剪贴板粘贴 / 模拟 Enter”这条输入链。
-
-先分开测：
-
-1. 让客户端调用 `open_chat`。如果只聚焦窗口但聊天框没打开，分别试 `backend: pydirectinput` 和 `backend: pyautogui`，并确认光遇窗口不是管理员权限而 MCP 普通权限。
-2. 手动在游戏里打开聊天输入框，再让客户端调用 `type_text`。如果这时能输入，说明问题在自动打开聊天框，不在粘贴。
-3. 如果手动打开聊天框后 `type_text` 也不能输入，优先检查管理员权限和输入后端。
-4. 如果光遇、Steam、启动器或游戏平台是管理员权限运行，`start-http.bat` 也要右键“以管理员身份运行”。
-5. 如果模型只调用了 `focus_game`，它只会聚焦窗口，不会输入文字。要让它调用 `send_chat`，或者在聊天框已打开时调用 `type_text`。
-
-推荐给 AI 客户端的测试顺序：
-
-```json
-{"name":"open_chat","arguments":{"backend":"pydirectinput"}}
-```
-
-聊天框打开后：
-
-```json
-{"name":"type_text","arguments":{"message":"hello","send":true,"backend":"pydirectinput"}}
-```
-
-如果不行，再把两个请求里的 `backend` 改成 `pyautogui` 试一次。
-
-## 按键没反应
-
-如果能截图、能 OCR，但是角色不动，说明 MCP 已经连上了，问题通常在 Windows 输入层。
-
-按顺序试：
-
-1. 手动点一下光遇窗口内部，再测 `press_key`。
-2. 把光遇切到窗口化或无边框窗口化。
-3. 右键“以管理员身份运行” `start-http.bat`，尤其是光遇或 Steam 本身用管理员权限启动时。
-4. 分别试 `backend: pydirectinput` 和 `backend: pyautogui`。
-5. 如果截图正常但两个后端都不能动，说明这台电脑上的光遇拦截了模拟输入，需要更底层的虚拟键盘/虚拟手柄方案。
 
 ## 安全边界
 
-- 不要把端口暴露到公网。
-- 不要把 token 发给不信任的人。
-- 截图和 OCR 可能包含聊天内容，不要公开上传调试日志。
-- 不建议做自动刷资源、自动跑图、代肝、骚扰等用途。
-- 如果游戏或平台规则不允许自动化，请停止使用。
+- 不要把 MCP 端口暴露到公网；token 不要发给不信任的人。
+- 截图/OCR 可能包含聊天内容，不要公开上传调试日志。
+- 不建议用于刷资源、自动跑图、代肝、骚扰等用途；游戏规则不允许自动化时请停止使用。
+
+## 致谢
+
+- 执行层最初基于
+  [Aevella/sky-pc-mcp-companion](https://github.com/Aevella/sky-pc-mcp-companion)
+  改造而来，感谢 Aevella 老师的原始工作；本仓库已重写为安卓模拟器 + adb 的工具库。
+
+## 免责声明
+
+本项目是屏幕识别 + 按键注入的自动化工具，仅供学习与研究。
+自动化操作可能违反游戏的用户协议，使用风险自负。
+它不修改游戏、不读写游戏内存、不影响其他玩家。
+
+## License
+
+MIT

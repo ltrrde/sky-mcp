@@ -1,11 +1,17 @@
-.venv/
-.venv-gpu/
-__pycache__/
-*.py[cod]
-*.log
 *.png
 *.jpg
-*.jpeg
-*.webp
-*.tmp
+debug_out/
+
+# 开发环境与临时文件
+.venv/
+vendor/
+.tmp/
+tests/.tmp_config/
+__pycache__/
+*.pyc
 .DS_Store
+
+# 本机运行配置（含 MCP token）；模板见 sky_config.example.json
+sky_config.json
+# 本机 adb 配置（共享配置见 adb_config.example.json）
+adb_config.json

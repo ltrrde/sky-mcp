@@ -1,0 +1,14 @@
+{
+  "adb_path": "G:\\AndroidSdk\\platform-tools\\adb.exe",
+  "serial": "127.0.0.1:16384",
+  "package": "com.netease.sky",
+  "keyboard_device": "/dev/input/event4",
+  "ime": {
+    "component": "com.android.adbkeyboard/.AdbIME",
+    "restore": true
+  },
+  "foreground_ttl": 0.6,
+  "shell_timeout": 20,
+  "startup_release": true,
+  "verbose": false
+}
