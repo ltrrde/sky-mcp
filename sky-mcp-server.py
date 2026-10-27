@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import importlib
 import json
 import os
@@ -66,6 +67,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -76,9 +78,12 @@ from sky_adb import (
     AdbError,
     normalize_key as _normalize_adb_key,
 )
+from sky_chat import (bubble_region, chat_region, panel_looks_open,
+                      parse_chat_items)
 from sky_config import ConfigError, default_config, load_config as load_sky_config
+from sky_ocr import OcrEngine, OcrError
 
-SERVER_INFO = {"name": "sky-mcp-server", "version": "0.4.0-toolkit"}
+SERVER_INFO = {"name": "sky-mcp-server", "version": "0.5.0-ocr-chat"}
 PROTOCOL_VERSION = "2025-03-26"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -99,7 +104,28 @@ MAX_CHAT_CHARS = 240
 
 
 class SkyError(RuntimeError):
-    """执行层错误。消息直接进 MCP tools/call 的 isError 文本，必须人能看懂。"""
+    """执行层错误。消息直接进 MCP tools/call 的 isError 文本，必须人能看懂。
+
+    ``code`` 是给 AI 客户端做错误分类用的（R5）：
+      foreground / ime / device / ocr / io / invalid / unknown
+    """
+
+    def __init__(self, message: str, code: str = "unknown"):
+        super().__init__(message)
+        self.code = code
+
+    def as_payload(self) -> dict[str, Any]:
+        return {"ok": False, "error_type": self.code, "error": str(self)}
+
+
+def now_iso() -> str:
+    """带本地时区的 ISO8601 时间（截帧/发送时间戳用）。"""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def new_frame_id() -> str:
+    """一次截屏的唯一 id（同一次 read_screen 里文本与图片共用）。"""
+    return f"{int(time.time() * 1000):x}-{secrets.token_hex(4)}"
 
 
 def log(message: str) -> None:
@@ -135,28 +161,48 @@ class ServerConfig:
     screenshot_max_width: int = 1920
     screenshot_max_height: int = 1080
     adb_config: AdbConfig | None = None
+    #: OCR 引擎：auto / paddleocr / rapidocr / tesseract / none（默认读 SKY_OCR_ENGINE）
+    ocr_engine: str | None = None
+    #: HTTP 启动时后台预热 OCR（首次加载模型很慢，别让第一个工具调用卡住）
+    ocr_prewarm: bool = True
+
+
+@dataclass(frozen=True)
+class CapturedFrame:
+    """一次截屏的结果 + 元数据（R4：image_size/captured_at/frame_id）。"""
+
+    png: bytes
+    width: int
+    height: int
+    frame_id: str
+    captured_at: str
 
 
 class AdbSkyController:
     """把所有 MCP 工具动作落到 AdbDevice 上。
 
-    测试时可以注入假设备（tests/fake_adb.FakeAdb + AdbDevice）::
+    生产默认自己创建真实 AdbDevice；测试/特殊部署可以注入自定义实例：
 
-        dev = AdbDevice(AdbConfig(adb_path="fake-adb"), runner=FakeAdb())
-        controller = AdbSkyController(ServerConfig(), device=dev)
+        controller = AdbSkyController(ServerConfig(), device=my_adb_device)
+        controller = AdbSkyController(ServerConfig(), ocr_engine=my_ocr_engine)
+
+    本仓库的真机测试（tests/test_*_real.py）都是直接注入真实设备 + 真实 rapidocr。
     """
 
     def __init__(self, config: ServerConfig | None = None,
-                 device: AdbDevice | None = None):
+                 device: AdbDevice | None = None,
+                 ocr_engine: Any = None):
         self.config = config or ServerConfig()
         self._device = device
         # 复合动作（open_chat/send_chat 的"开输入框→打字→发送"）串行执行；
         # 单按键的并发安全由 AdbDevice 自己的 _input_lock 保证。
         self._action_lock = threading.RLock()
-        # OCR 引擎 / 设备名缓存
-        self._ocr_engine: Any = None
-        self._ocr_name = "none"
-        self._ocr_device = "unknown"
+        # OCR 引擎（sky_ocr.OcrEngine；测试可注入假引擎 duck-type）
+        self._ocr_impl: Any = ocr_engine
+        self._ocr_init_lock = threading.Lock()
+        # 最近发出的聊天文本（read_chat 判断 is_self 用；10 分钟窗口）
+        self._sent_history: list[tuple[str, float]] = []
+        self._send_lock = threading.Lock()
         # 截屏依赖（numpy/cv2）惰性探测：只探一次，失败后一直走 PNG 兜底
         self._cv2: Any = None
         self._np: Any = None
@@ -181,17 +227,27 @@ class AdbSkyController:
         try:
             dev.ensure_ready()
         except AdbError as exc:
-            raise SkyError(str(exc)) from exc
+            raise SkyError(str(exc), code="device") from exc
         return dev
 
     def _require_foreground(self, dev: AdbDevice | None = None) -> dict[str, Any]:
         """前台守卫：游戏不在前台就拒绝（错误消息里带「前台」字样，
-        方便 AI 客户端识别"用户切走了，等会儿再试"）。"""
+        方便 AI 客户端识别"用户切走了，等会儿再试"；错误码 foreground）。"""
         dev = dev or self._ready_device()
         try:
             return dev.require_game_foreground()
         except AdbError as exc:
-            raise SkyError(str(exc)) from exc
+            text = str(exc)
+            # ADBKeyboard 崩溃时前台会变成 "Application Error: com.android.adbkeyboard"；
+            # 这时不是"用户切走了"，按 ime 报错让客户端知道该重启输入法。
+            code = "ime" if "adbkeyboard" in text.lower() else "foreground"
+            raise SkyError(text, code=code) from exc
+
+    def _remember_sent(self, message: str) -> None:
+        """记录最近发出的聊天（read_chat 用它把"无名字裸行"认成自己发的）。"""
+        with self._send_lock:
+            self._sent_history.append((message, time.time()))
+            self._sent_history = self._sent_history[-50:]
 
     def close(self) -> None:
         """退出清理：松开所有悬键 + 还原用户原来的输入法。"""
@@ -254,7 +310,11 @@ class AdbSkyController:
             else:
                 dev.combo(keys, duration_ms)
         except AdbError as exc:
-            raise SkyError(str(exc)) from exc
+            # 按键类错误也做分类（前台守卫 / IME / 设备），R5 客户端据此重试
+            text = str(exc)
+            code = ("foreground" if "前台" in text
+                    else ("ime" if "adbkeyboard" in text.lower() else "device"))
+            raise SkyError(text, code=code) from exc
 
     def press_key(self, key: str, duration_ms: int = 80,
                   backend: str | None = None) -> str:
@@ -282,11 +342,37 @@ class AdbSkyController:
     @staticmethod
     def _validate_message(message: Any) -> str:
         if not isinstance(message, str) or not message.strip():
-            raise SkyError("message must be a non-empty string")
+            raise SkyError("message must be a non-empty string", code="invalid")
         if len(message) > MAX_CHAT_CHARS:
             raise SkyError(
-                f"message is too long; keep it under {MAX_CHAT_CHARS} characters")
+                f"message is too long; keep it under {MAX_CHAT_CHARS} characters",
+                code="invalid")
         return message
+
+    @staticmethod
+    def _reply_receipt(message: str, *, send: bool, backend: str,
+                       action: str) -> dict[str, Any]:
+        """发送/输入回执（R5）：AI 客户端据此判断是否发出、是否需要重试。"""
+        return {
+            "ok": True,
+            "action": action,               # sent | typed
+            "sent": bool(send),
+            "sent_at": now_iso(),
+            "chars": len(message),
+            "truncated": len(message) >= MAX_CHAT_CHARS,
+            "message": message,
+            "backend": backend,
+        }
+
+    @staticmethod
+    def _wrap_ime_error(exc: AdbError) -> "SkyError":
+        """ADBKeyboard/输入法类失败单独给 error_type=ime，方便客户端提示装输入法。"""
+        text = str(exc)
+        if "ADBKeyboard" in text or "输入法" in text:
+            return SkyError(text, code="ime")
+        if "前台" in text:
+            return SkyError(text, code="foreground")
+        return SkyError(text, code="device")
 
     def type_text(
         self,
@@ -295,40 +381,64 @@ class AdbSkyController:
         enter_tap_ms: int = 35,
         backend: str | None = None,
         require_foreground: bool = True,
-    ) -> str:
-        """往「已经打开的」聊天输入框打字（中文走 ADBKeyboard），可选回车发送。"""
+    ) -> dict[str, Any]:
+        """往「已经打开的」聊天输入框打字（中文走 ADBKeyboard），可选回车发送。
+
+        返回回执 JSON（R5）：ok/action/sent/sent_at/chars/truncated/message/backend。
+        """
         message = self._validate_message(message)
         resolved = self.resolve_backend(backend)
         tap_ms = self._clamp_ms(enter_tap_ms)
         with self._action_lock:
             # 打字 = 往当前焦点输入框塞文本；游戏不在前台时必须拒绝，
             # 否则文本会进别的 App（和按键的前台守卫同一个理由）。
-            if require_foreground:
-                self._require_foreground()
+            # 先自愈 IME 再查前台：ADBKeyboard 崩溃对话框会挡住前台判定。
             dev = self._ready_device()
             try:
+                dev.ensure_ime_healthy()
+            except AdbError as exc:
+                raise self._wrap_ime_error(exc) from exc
+            if require_foreground:
+                self._require_foreground(dev)
+            try:
+                if not dev.wait_input_connection(2.0):
+                    raise SkyError(
+                        "聊天输入框没有拿到输入焦点（ADBKeyboard 无法提交文字）："
+                        "请先打开聊天输入框再打字。", code="ime")
                 dev.type_text(message)
                 if send:
+                    # IME 广播提交文字和游戏输入框刷新有延迟：立刻回车会把
+                    # "还没上屏"的消息当成空消息发出去（真机实测）。
+                    time.sleep(0.12)
                     dev.press_key("enter", tap_ms)
             except AdbError as exc:
-                raise SkyError(str(exc)) from exc
+                raise self._wrap_ime_error(exc) from exc
+        if send:
+            self._remember_sent(message)
         action = "sent" if send else "typed"
-        return f"{action} text: {message} via {resolved}"
+        return self._reply_receipt(message, send=send, backend=resolved,
+                                   action=action)
 
     def send_chat(
         self,
         message: str,
         open_key: str = "enter",
-        open_delay_ms: int = 180,
+        open_delay_ms: int = 500,
         assume_open: bool = False,
         send: bool = True,
         enter_tap_ms: int = 35,
         backend: str | None = None,
-    ) -> str:
+        verify: bool = False,
+    ) -> dict[str, Any]:
         """开聊天输入框 → 输入一条消息（中文可用）→ 可选回车发送。
 
         和旧版语义一致：``assume_open=True`` 表示输入框已经由人手动打开，
         这时不再按 open_key（避免短按 enter 又把输入框关掉）。
+        返回回执 JSON（R5），字段同 type_text。
+
+        ``verify=True`` 时发完会再做一次 read_chat 回读校验（额外约 4~5s）：
+        回执里带 ``verified``；为 False 时带 ``verify_error="send_key"``，
+        用于区分「发送键没生效/消息没上屏」和「其实发出去了但 OCR 认不出」。
         """
         message = self._validate_message(message)
         resolved = self.resolve_backend(backend)
@@ -337,12 +447,19 @@ class AdbSkyController:
         try:
             delay = max(0.0, float(open_delay_ms)) / 1000.0
         except (TypeError, ValueError):
-            raise SkyError(f"open_delay_ms 必须是数字: {open_delay_ms!r}") from None
+            raise SkyError(
+                f"open_delay_ms 必须是数字: {open_delay_ms!r}",
+                code="invalid") from None
         with self._action_lock:
-            # 先查一次前台，别在别的 App 上按 enter 开输入框；后面的每次
-            # 按键 / 打字也各自带守卫（用户中途切走会立刻报错）。
-            self._require_foreground()
+            # 先自愈 IME（ADBKeyboard 崩溃对话框会挡住前台判定），再查前台。
             dev = self._ready_device()
+            try:
+                dev.ensure_ime_healthy()
+            except AdbError as exc:
+                raise self._wrap_ime_error(exc) from exc
+            # 再查前台，别在别的 App 上按 enter 开输入框；后面的每次
+            # 按键 / 打字也各自带守卫（用户中途切走会立刻报错）。
+            self._require_foreground(dev)
             try:
                 if not assume_open:
                     if len(open_keys) == 1:
@@ -350,13 +467,40 @@ class AdbSkyController:
                     else:
                         dev.combo(open_keys, tap_ms)
                     time.sleep(delay)
+                # 等输入框真正拿到 InputConnection：没有连接时广播会让
+                # ADBKeyboard 崩溃且消息被静默丢弃（真机踩坑）。
+                if not dev.wait_input_connection(3.0):
+                    if not assume_open:
+                        # 再补按一次 open key（可能上一按被动画/卡顿吃掉）
+                        if len(open_keys) == 1:
+                            dev.press_key(open_keys[0], tap_ms)
+                        else:
+                            dev.combo(open_keys, tap_ms)
+                        time.sleep(delay)
+                    if not dev.wait_input_connection(2.0):
+                        raise SkyError(
+                            "聊天输入框没有拿到输入焦点（ADBKeyboard 无法提交"
+                            "文字，可能游戏卡顿/输入框被遮挡）。重试或先手动"
+                            "打开聊天输入框。", code="ime")
                 dev.type_text(message)
                 if send:
+                    # 同上：等 IME 把文字提交进游戏输入框再按回车发送
+                    time.sleep(0.12)
                     dev.press_key("enter", tap_ms)
             except AdbError as exc:
-                raise SkyError(str(exc)) from exc
-        action = "sent" if send else "typed"
-        return f"{action} chat: {message} via {resolved}"
+                raise self._wrap_ime_error(exc) from exc
+        receipt = self._reply_receipt(
+            message, send=send, backend=resolved,
+            action="sent" if send else "typed")
+        if send and verify:
+            verified = self._verify_sent(message)
+            receipt["verified"] = verified
+            if verified is False:
+                # 消息没在面板/气泡里出现：发送键没生效或界面没刷新
+                receipt["verify_error"] = "send_key"
+        if send:
+            self._remember_sent(message)
+        return receipt
 
     # ===================== 前台 / 焦点 =====================
 
@@ -439,6 +583,19 @@ class AdbSkyController:
                 interpolation=cv2.INTER_AREA)
         return image
 
+    def capture_frame(self) -> CapturedFrame:
+        """截一帧并附带元数据（R4：image_size / captured_at / frame_id）。
+
+        同一次 read_screen / read_chat 里 OCR 与返回的图片必须共用同一帧，
+        所以截屏只做一次，把 png 和元数据一起往后传。
+        """
+        data = self.capture_png()
+        width, height = self._png_size(data)
+        if width <= 0 or height <= 0:
+            raise SkyError("截屏 PNG 尺寸解析失败", code="device")
+        return CapturedFrame(png=data, width=width, height=height,
+                             frame_id=new_frame_id(), captured_at=now_iso())
+
     def capture_png(self) -> bytes:
         """截一张游戏画面，返回 PNG bytes。
 
@@ -458,7 +615,8 @@ class AdbSkyController:
             expected = width * height * 4
             if frame.size < expected:
                 raise SkyError(
-                    f"截屏数据不完整（{frame.size}/{expected} 字节）")
+                    f"截屏数据不完整（{frame.size}/{expected} 字节）",
+                    code="device")
             frame = frame[:expected].reshape((height, width, 4))
             code = (cv2.COLOR_RGBA2BGR if pixel_format == "rgba"
                     else cv2.COLOR_BGRA2BGR)
@@ -467,17 +625,25 @@ class AdbSkyController:
             ok, buffer = cv2.imencode(
                 ".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 1])
             if not ok:
-                raise SkyError("PNG 编码失败")
+                raise SkyError("PNG 编码失败", code="device")
             return buffer.tobytes()
         except SkyError:
             raise
         except Exception as exc:
             return self._screencap_png_fallback(f"raw 帧处理失败: {exc}")
 
-    def screenshot_base64(self, png: bytes | None = None) -> str:
-        """截屏 → PNG base64（MCP image content 用）。"""
-        data = png if png is not None else self.capture_png()
-        return base64.b64encode(data).decode("ascii")
+    def _as_frame(self, png: bytes | None = None,
+                  frame: CapturedFrame | None = None) -> CapturedFrame:
+        """统一取帧：优先外部传入（保证同帧复用），否则现场截一张。"""
+        if frame is not None:
+            return frame
+        if png is None:
+            return self.capture_frame()
+        width, height = self._png_size(png)
+        if width <= 0 or height <= 0:
+            raise SkyError("PNG 尺寸解析失败", code="invalid")
+        return CapturedFrame(png=png, width=width, height=height,
+                             frame_id=new_frame_id(), captured_at=now_iso())
 
     @staticmethod
     def _png_size(data: bytes) -> tuple[int, int]:
@@ -489,172 +655,358 @@ class AdbSkyController:
                 return width, height
         return 0, 0
 
-    def read_screen(self, png: bytes | None = None) -> dict[str, Any]:
-        """截屏 + OCR，返回可见文本列表（OCR 引擎缺失时返回提示，不抛异常）。"""
+    def screenshot_base64(self, png: bytes | None = None) -> str:
+        """截屏 → PNG base64（MCP image content 用）。"""
         data = png if png is not None else self.capture_png()
-        width, height = self._png_size(data)
-        path = None
+        return base64.b64encode(data).decode("ascii")
+
+    def save_png(self, frame: CapturedFrame,
+                 save_path: str | None) -> str | None:
+        """可选：把当前帧另存为 PNG（R4 save_path）。返回绝对路径或 None。"""
+        if not save_path:
+            return None
         try:
-            with tempfile.NamedTemporaryFile(
-                    prefix="sky-mcp-", suffix=".png", delete=False) as tmp:
-                tmp.write(data)
-                path = tmp.name
-            return {
-                "ocr": self._detect_ocr_name(),
-                "ocr_device": self._ocr_device,
-                "image_size": {"width": width, "height": height},
-                "texts": self._run_ocr(path),
-            }
-        finally:
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            path = os.path.abspath(os.path.expanduser(str(save_path)))
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(frame.png)
+            return path
+        except OSError as exc:
+            raise SkyError(f"保存截图失败: {exc}", code="io") from exc
 
-    def _detect_ocr_name(self) -> str:
-        """探测 OCR 引擎（PaddleOCR 优先，Tesseract 兜底），算出来的名字缓存。"""
-        if self._ocr_engine is not None:
-            return self._ocr_name
+    # ===================== OCR（sky_ocr）/ 聊天（sky_chat） =====================
+
+    @property
+    def ocr_engine(self):
+        """惰性创建 OCR 引擎；测试可注入任意 duck-type（status/run/prewarm）。"""
+        if self._ocr_impl is None:
+            with self._ocr_init_lock:
+                if self._ocr_impl is None:
+                    try:
+                        self._ocr_impl = OcrEngine(self.config.ocr_engine)
+                    except Exception as exc:  # 构造失败也要让 tools 能报诊断
+                        raise SkyError(
+                            f"OCR 引擎初始化失败: {exc}", code="ocr") from exc
+        return self._ocr_impl
+
+    def ocr_status(self) -> dict[str, Any]:
+        """OCR 状态（绝不抛异常：status / health / 工具降级都要能用）。"""
+        fallback: dict[str, Any] = {
+            "ocr": "none", "ocr_engine": "none", "ocr_device": "unknown",
+            "ocr_error": "", "ocr_ready": False, "ocr_load_ms": 0.0,
+            "ocr_available": [], "ocr_chain": ["paddleocr", "rapidocr",
+                                              "tesseract"],
+        }
         try:
-            os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
-            os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-            from paddleocr import PaddleOCR
-            try:
-                import paddle
-                if paddle.device.is_compiled_with_cuda():
-                    paddle.set_device("gpu:0")
-                self._ocr_device = paddle.get_device()
-            except Exception:
-                self._ocr_device = "unknown"
+            status = self.ocr_engine.status()
+        except Exception as exc:
+            fallback["ocr_error"] = f"OCR 引擎初始化失败: {exc}"
+            return fallback
+        if not isinstance(status, dict):
+            return fallback
+        merged = dict(fallback)
+        merged.update(status)
+        return merged
 
-            self._ocr_engine = PaddleOCR(
-                use_angle_cls=False, lang="ch", det_limit_side_len=1920)
-            self._ocr_name = f"paddleocr-mobile-{self._ocr_device}"
-            return self._ocr_name
-        except Exception:
-            pass
-        try:
-            import pytesseract
-            pytesseract.get_tesseract_version()
-            self._ocr_engine = pytesseract
-            self._ocr_name = "tesseract"
-            return self._ocr_name
-        except Exception:
-            pass
-        self._ocr_name = "none"
-        return self._ocr_name
+    def prewarm_ocr(self) -> dict[str, Any]:
+        """加载 OCR 模型（HTTP 启动后由后台线程调用，避免首调阻塞）。
 
-    def _enhance_image(self, image_path: str) -> str:
-        """OCR 前放大 2 倍 + 提对比度 + 锐化；cv2 缺失时原图直出。
-
-        返回处理后的临时图片路径（无需处理时返回原路径，调用方负责清理）。
+        加载后再用「真实尺寸的空白图」各跑一遍 full 与 chat 区域：onnxruntime
+        首帧按输入形状做图优化/内存分配，不预热的话第一次 read_screen 会额外
+        多 0.5~1.5s（R3 的 ≤3s 就被这次抖动顶破）。预热图是纯色 PNG，很快。
         """
-        cv2, np = self._capture_libs()
-        if cv2 is None or np is None:
-            return image_path
         try:
-            # np.fromfile + imdecode：Windows 下 cv2.imread 对中文路径不友好
-            raw = np.fromfile(image_path, dtype=np.uint8)
-            image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-            if image is None:
-                return image_path
-            height, width = image.shape[:2]
-            image = cv2.resize(
-                image, (max(1, width * 2), max(1, height * 2)),
-                interpolation=cv2.INTER_LINEAR)
-            image = cv2.convertScaleAbs(image, alpha=1.5, beta=0)  # 对比度
-            blur = cv2.GaussianBlur(image, (0, 0), 1.0)
-            image = cv2.addWeighted(image, 1.5, blur, -0.5, 0)     # 锐化(USM)
-            ok, buffer = cv2.imencode(".png", image)
-            if not ok:
-                return image_path
-            enhanced_path = image_path + ".enhanced.png"
-            with open(enhanced_path, "wb") as handle:
-                handle.write(buffer.tobytes())
-            return enhanced_path
-        except Exception:
-            return image_path
-
-    def _run_ocr(self, image_path: str) -> list[dict[str, Any]]:
-        engine = self._detect_ocr_name()
-        if engine.startswith("paddleocr"):
-            return self._run_paddle_ocr(image_path)
-        if engine == "tesseract":
-            return self._run_tesseract_ocr(image_path)
-        return [{
-            "text": "未安装 OCR 引擎（PaddleOCR / Tesseract 都不可用）",
-            "confidence": 0, "x": 0, "y": 0,
-        }]
-
-    def _run_paddle_ocr(self, image_path: str) -> list[dict[str, Any]]:
-        """PaddleOCR。兼容 PaddleOCR 3.x（结果 dict）和 2.x（line 列表）两种格式。
-
-        坐标从放大 2 倍的图上算出来，这里统一除 2 还原到截图坐标系。
-        """
-        enhanced_path = self._enhance_image(image_path)
-        try:
+            status = self.ocr_engine.prewarm()
             try:
-                result = self._ocr_engine.ocr(enhanced_path, cls=True)
-            except Exception:
-                result = self._ocr_engine.ocr(enhanced_path)
-        finally:
-            if enhanced_path != image_path:
-                try:
-                    os.unlink(enhanced_path)
-                except OSError:
-                    pass
-        if not result:
-            return []
+                width = max(320, int(self.config.screenshot_max_width))
+                height = max(180, int(self.config.screenshot_max_height))
+                warm_full = self._warmup_png(width, height)
+                self.ocr_engine.run(warm_full, preprocess="default")
+                region = chat_region((width, height))
+                self.ocr_engine.run(warm_full, region=region, preprocess="chat")
+            except Exception as exc:  # 预热推理失败不影响正事，下次真调用再报
+                log(f"OCR 预热推理失败（忽略）: {exc}")
+            log(f"OCR 预热完成: engine={status.get('ocr')} "
+                f"ready={status.get('ocr_ready')} "
+                f"load_ms={status.get('ocr_load_ms')}")
+            return status
+        except Exception as exc:
+            log(f"OCR 预热失败（read_screen/read_chat 仍返回诊断）: {exc}")
+            return self.ocr_status()
 
-        texts: list[dict[str, Any]] = []
-        if isinstance(result[0], dict):
-            for page in result:
-                rec_texts = page.get("rec_texts") or []
-                rec_scores = page.get("rec_scores") or []
-                rec_boxes = page.get("rec_polys") or page.get("dt_polys") or []
-                for index, text in enumerate(rec_texts):
-                    points = rec_boxes[index] if index < len(rec_boxes) else []
-                    if hasattr(points, "tolist"):
-                        points = points.tolist()
-                    xs = [p[0] for p in points] if points else [0]
-                    ys = [p[1] for p in points] if points else [0]
-                    texts.append({
-                        "text": str(text),
-                        "confidence": (float(rec_scores[index])
-                                       if index < len(rec_scores) else 0),
-                        "x": int(min(xs) / 2),
-                        "y": int(min(ys) / 2),
-                    })
-            return texts
+    @staticmethod
+    def _warmup_png(width: int = 240, height: int = 80) -> bytes:
+        """生成一张纯白 PNG（纯标准库），用于按真实尺寸预热推理。"""
+        import zlib
 
-        for line in result[0] or []:
-            box, (text, confidence) = line[0], line[1]
-            texts.append({
-                "text": str(text),
-                "confidence": float(confidence),
-                "x": int(min(p[0] for p in box) / 2),
-                "y": int(min(p[1] for p in box) / 2),
-            })
-        return texts
+        width, height = max(8, int(width)), max(8, int(height))
+        row = b"\x00" + b"\xff\xff\xff" * width
+        raw = row * height
 
-    def _run_tesseract_ocr(self, image_path: str) -> list[dict[str, Any]]:
-        enhanced_path = self._enhance_image(image_path)
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+    def _region_for(self, region: Any,
+                    size: tuple[int, int]) -> tuple[Any, str]:
+        """工具参数 region → (sky_ocr 绝对裁剪区, 规范名)。"""
+        name = str(region or "full").strip().lower()
+        if name in ("full", "all", ""):
+            return None, "full"
+        if name == "chat":
+            return chat_region(size), "chat"
+        if name == "bubble":
+            return bubble_region(size), "bubble"
+        raise SkyError(
+            f"未知 region={region!r}（可用: full / chat / bubble）",
+            code="invalid")
+
+    def _ocr_frame(self, frame: CapturedFrame, region: Any):
+        """对一帧做 OCR。返回 (OcrResult|None, region名, preprocess, error)。"""
+        region_px, region_name = self._region_for(
+            region, (frame.width, frame.height))
+        preprocess = "chat" if region_name in ("chat", "bubble") else "default"
         try:
-            # pytesseract 自己会处理文件/像素转换，这里不直接依赖图像库
-            text = self._ocr_engine.image_to_string(
-                enhanced_path, lang="chi_sim+eng")
-        finally:
-            if enhanced_path != image_path:
-                try:
-                    os.unlink(enhanced_path)
-                except OSError:
-                    pass
-        return [
-            {"text": line.strip(), "confidence": 0.5, "x": 0, "y": 0}
-            for line in text.splitlines()
-            if line.strip()
-        ]
+            result = self.ocr_engine.run(
+                frame.png, region=region_px, preprocess=preprocess)
+            return result, region_name, preprocess, ""
+        except OcrError as exc:
+            return None, region_name, preprocess, str(exc)
+        except Exception as exc:  # 兜住引擎内部意外，工具不 500
+            return None, region_name, preprocess, f"OCR 失败: {exc}"
+
+    def read_screen(self, png: bytes | None = None, *,
+                    region: str = "full",
+                    save_path: str | None = None,
+                    frame: CapturedFrame | None = None) -> dict[str, Any]:
+        """截屏 + OCR（R1/R3/R4）。
+
+        引擎不可用时不抛异常：``texts=[]`` 且 ``ocr_error`` 给出可操作原因，
+        AI 客户端可回退本地 OCR 或改用视觉模型。
+        """
+        frame = self._as_frame(png, frame)
+        status = self.ocr_status()
+        result, region_name, preprocess, ocr_error = self._ocr_frame(
+            frame, region)
+        payload: dict[str, Any] = {
+            "ocr": status.get("ocr", "none"),
+            "ocr_engine": status.get("ocr_engine", status.get("ocr", "none")),
+            "ocr_device": status.get("ocr_device", "unknown"),
+            "ocr_error": ocr_error or str(status.get("ocr_error") or ""),
+            "ocr_ready": bool(status.get("ocr_ready", False)),
+            "image_size": {"width": frame.width, "height": frame.height},
+            "captured_at": frame.captured_at,
+            "frame_id": frame.frame_id,
+            "region": region_name,
+            "preprocess": preprocess,
+            "ocr_ms": round(float(result.ocr_ms), 1) if result else 0.0,
+            "texts": result.texts() if result else [],
+        }
+        saved = self.save_png(frame, save_path)
+        if saved:
+            payload["saved_path"] = saved
+        return payload
+
+    #: 聊天界面里的通用称呼/菜单词：OCR 只剩这些碎片时不是一条真消息
+    _CHAT_NOISE_TEXTS = frozenset({
+        "陌生人", "光之子", "玩家", "旅人",
+        "图像", "音频", "控制", "账号", "好友", "商店", "遇境", "精灵",
+        "活动", "邮箱", "好友码", "王国客服", "更多", "聊天", "发送",
+        "语音输入", "图像设置", "聊天记录",
+    })
+
+    @staticmethod
+    def _norm_chat_text(text: Any) -> str:
+        """聊天文本归一化：去空白/标点/符号，保留中英文数字（用于去重与相似）。"""
+        return re.sub(r"[\s\W_]+", "", str(text or "")).lower()
+
+    @classmethod
+    def _looks_like_own(cls, text: str, own_texts: list[str]) -> bool:
+        """判断一条消息是不是最近自己发出的（光遇自己消息不显示名字）。"""
+        norm = cls._norm_chat_text(text)
+        if not norm:
+            return False
+        for sent in own_texts:
+            other = cls._norm_chat_text(sent)
+            if not other:
+                continue
+            if norm == other:
+                return True
+            if len(norm) >= 2 and len(other) >= 2:
+                if difflib.SequenceMatcher(None, norm, other).ratio() >= 0.72:
+                    return True
+                common = sum(1 for char in set(norm) if char in other)
+                if common / max(1, len(set(norm))) >= 0.8:
+                    return True
+        return False
+
+    def _verify_sent(self, message: str) -> bool | None:
+        """发后回读校验：自己的消息是否出现在面板/气泡里（R5 发送键失效检测）。
+
+        返回 True=找到、False=没找到、None=无法判断（OCR 不可用/读屏失败）。
+        只做候选匹配（字符命中 ≥0.6 或序列相似 ≥0.8），不要求逐字一致。
+        """
+        # 发送键按下后气泡/面板渲染有延迟，先等 UI 上屏再截帧（真机实测 0.8s 足够）
+        time.sleep(0.8)
+        try:
+            chat = self.read_chat(limit=10)
+        except Exception:
+            return None
+        target = self._norm_chat_text(message)
+        if not target:
+            return None
+        best = 0.0
+        for item in chat.get("messages") or []:
+            text = self._norm_chat_text(item.get("text") or "")
+            if not text:
+                continue
+            if target in text or text in target:
+                return True
+            if difflib.SequenceMatcher(None, target, text).ratio() >= 0.8:
+                return True
+            common = sum(1 for char in set(target) if char in text)
+            best = max(best, common / max(1, len(set(target))))
+        return best >= 0.6
+
+    def _clean_chat_message(self, message: dict[str, Any],
+                            own_texts: list[str]) -> dict[str, Any] | None:
+        """过滤名字碎片/UI 噪音，并补齐 is_self（bubble 模式原本不标）。"""
+        text = str(message.get("text") or "").strip()
+        if len(text) < 2:
+            return None
+        if text == str(message.get("speaker") or ""):
+            return None
+        if text in self._CHAT_NOISE_TEXTS:
+            return None
+        if not self._norm_chat_text(text):
+            return None
+        if not message.get("is_self") and self._looks_like_own(text, own_texts):
+            message["is_self"] = True
+        return message
+
+    def _merge_chat_messages(self, groups: list[list[dict[str, Any]]],
+                             own_texts: list[str],
+                             limit: int) -> list[dict[str, Any]]:
+        """合并 panel/bubble 两路结果：同文本去重（panel 的 speaker 优先），按 y 排序。"""
+        merged: list[dict[str, Any]] = []
+        index: dict[str, int] = {}
+        for messages in groups:
+            for raw in messages:
+                message = self._clean_chat_message(dict(raw), own_texts)
+                if message is None:
+                    continue
+                key = self._norm_chat_text(message["text"])
+                if key in index:
+                    existing = merged[index[key]]
+                    if message.get("speaker") and not existing.get("speaker"):
+                        existing["speaker"] = message["speaker"]
+                        existing["kind"] = "panel"
+                    existing["is_self"] = bool(
+                        existing.get("is_self") or message.get("is_self"))
+                    existing["confidence"] = max(
+                        float(existing.get("confidence") or 0.0),
+                        float(message.get("confidence") or 0.0))
+                    continue
+                index[key] = len(merged)
+                merged.append(message)
+        merged.sort(key=lambda item: (int(item.get("y") or 0),
+                                      int(item.get("x") or 0)))
+        if limit and len(merged) > limit:
+            merged = merged[-limit:]
+        return merged
+
+    def _recent_sent_texts(self) -> list[str]:
+        now = time.time()
+        with self._send_lock:
+            self._sent_history = [(text, ts) for text, ts in self._sent_history
+                                  if now - ts < 600.0]
+            return [text for text, _ in self._sent_history]
+
+    def read_chat(self, png: bytes | None = None, *,
+                  limit: Any = 20,
+                  mode: str = "auto",
+                  save_path: str | None = None,
+                  frame: CapturedFrame | None = None) -> dict[str, Any]:
+        """读取游戏内聊天（R2）：聊天面板 + 世界气泡两路 OCR，合并成结构化消息。
+
+        - mode=auto：同时读聊天面板（带名字的日志行）和世界气泡（发送后的消息
+          会以气泡叠在输入框上方），两路合并、按文本去重、按 y 排序；
+        - mode=panel / bubble：只读对应区域；
+        - 返回字段：messages / ocr / ocr_device / ocr_error / ocr_ready /
+          ocr_ms / image_size / captured_at / frame_id / region / mode / panel_open。
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise SkyError(f"limit 必须是整数: {limit!r}", code="invalid") from None
+        limit = min(max(1, limit), 100)
+        mode = str(mode or "auto").strip().lower()
+        if mode not in ("auto", "panel", "bubble"):
+            raise SkyError(
+                f"未知 mode={mode!r}（可用: auto / panel / bubble）",
+                code="invalid")
+        frame = self._as_frame(png, frame)
+        status = self.ocr_status()
+        own_texts = self._recent_sent_texts()
+
+        groups: list[list[dict[str, Any]]] = []
+        used: list[str] = []
+        errors: list[str] = []
+        ocr_ms = 0.0
+        panel_open: bool | None = None
+
+        if mode in ("auto", "panel"):
+            result, _name, _pre, err = self._ocr_frame(frame, "chat")
+            if err:
+                errors.append(err)
+            if result is not None:
+                texts = result.texts()
+                ocr_ms += float(result.ocr_ms)
+                used.append("chat")
+                panel_open = panel_looks_open(
+                    texts, (frame.width, frame.height))
+                groups.append(parse_chat_items(
+                    texts, own_texts=own_texts, mode="panel", limit=limit,
+                    image_size=(frame.width, frame.height)))
+        if mode in ("auto", "bubble"):
+            result, _name, _pre, err = self._ocr_frame(frame, "bubble")
+            if err:
+                errors.append(err)
+            if result is not None:
+                ocr_ms += float(result.ocr_ms)
+                used.append("bubble")
+                groups.append(parse_chat_items(
+                    result.texts(), own_texts=own_texts,
+                    mode="bubble", limit=limit,
+                    image_size=(frame.width, frame.height)))
+
+        messages = self._merge_chat_messages(groups, own_texts, limit)
+
+        payload: dict[str, Any] = {
+            "messages": messages,
+            "ocr": status.get("ocr", "none"),
+            "ocr_engine": status.get("ocr_engine", status.get("ocr", "none")),
+            "ocr_device": status.get("ocr_device", "unknown"),
+            "ocr_error": "; ".join(errors) or str(status.get("ocr_error") or ""),
+            "ocr_ready": bool(status.get("ocr_ready", False)),
+            "ocr_ms": round(ocr_ms, 1),
+            "image_size": {"width": frame.width, "height": frame.height},
+            "captured_at": frame.captured_at,
+            "frame_id": frame.frame_id,
+            "region": "+".join(used) if used else "none",
+            "mode": mode,
+            "panel_open": panel_open,
+        }
+        saved = self.save_png(frame, save_path)
+        if saved:
+            payload["saved_path"] = saved
+        return payload
 
     # ===================== 自检 =====================
 
@@ -663,19 +1015,29 @@ class AdbSkyController:
 
         字段平铺在顶层：mode / platform / input_backend / adb / serial /
         package / keyboard_device / screen / foreground / ime / device_model /
-        android_version / ocr / ocr_device / screenshot_max / device_ready。
+        android_version / ocr / ocr_engine / ocr_device / ocr_error /
+        ocr_ready / ocr_load_ms / ocr_available / ocr_chain /
+        screenshot_max / device_ready。
 
         设备层出错时不抛异常，而是塞 ``error`` 字段——客户端能直接看到
         具体原因（adb 没连上 / 没有设备 / 没装输入法…）。
         前台状态只体现在 foreground.is_game。
         """
         backend = self.resolve_backend()
+        ocr = self.ocr_status()
         info: dict[str, Any] = {
             "mode": "android-emulator",
             "platform": sys.platform,
             "input_backend": backend,
-            "ocr": self._detect_ocr_name(),
-            "ocr_device": self._ocr_device,
+            # R1：OCR 引擎名 + 诊断（哪一步失败、装了没、是否已预热）
+            "ocr": ocr.get("ocr", "none"),
+            "ocr_engine": ocr.get("ocr", "none"),
+            "ocr_device": ocr.get("ocr_device", "unknown"),
+            "ocr_error": str(ocr.get("ocr_error") or ""),
+            "ocr_ready": bool(ocr.get("ocr_ready", False)),
+            "ocr_load_ms": float(ocr.get("ocr_load_ms") or 0.0),
+            "ocr_available": ocr.get("ocr_available", []),
+            "ocr_chain": ocr.get("ocr_chain", []),
             "screenshot_max": {
                 "width": int(self.config.screenshot_max_width),
                 "height": int(self.config.screenshot_max_height),
@@ -746,24 +1108,25 @@ TOOLS = [
     },
     {
         "name": "send_chat",
-        "description": "Open Sky chat, type a message through the ADBKeyboard IME (Chinese and emoji supported), and optionally send it with Enter.",
+        "description": "Open Sky chat, type a message through the ADBKeyboard IME (Chinese and emoji supported), and optionally send it with Enter. Returns a JSON receipt: ok/action/sent/sent_at/chars/truncated/message/backend; errors carry error_type (foreground/ime/device).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "message": {"type": "string", "description": "Chat message under 240 characters."},
                 "open_key": {"type": "string", "description": "Key used to open the chat input.", "default": "enter"},
-                "open_delay_ms": {"type": "integer", "description": "Delay after opening chat before typing.", "default": 180},
+                "open_delay_ms": {"type": "integer", "description": "Delay after opening chat before typing (IME needs time to focus the input).", "default": 500},
                 "assume_open": {"type": "boolean", "description": "Set true when the chat input is already open; no open key is sent.", "default": False},
                 "send": {"type": "boolean", "description": "Set false to type without pressing Enter.", "default": True},
                 "enter_tap_ms": {"type": "integer", "description": "Short Enter tap duration.", "default": 35},
                 "backend": {"type": "string", "description": "Input backend override: adb or auto.", "default": "adb"},
+                "verify": {"type": "boolean", "description": "After sending, OCR the chat again to verify the message appeared (adds ~4-5s). Receipt then has verified; verified=false carries verify_error=send_key.", "default": False},
             },
             "required": ["message"],
         },
     },
     {
         "name": "type_text",
-        "description": "Type text into an already-open Sky chat input through the ADBKeyboard IME and optionally send. Use this when the user manually opened the input box.",
+        "description": "Type text into an already-open Sky chat input through the ADBKeyboard IME and optionally send. Use this when the user manually opened the input box. Returns the same JSON receipt as send_chat.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -778,13 +1141,36 @@ TOOLS = [
     },
     {
         "name": "read_screen",
-        "description": "Capture the emulator screen and OCR visible text.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "Capture the emulator screen and OCR visible text. Returns ocr engine info, ocr_error diagnostics, ocr_ms, image_size/captured_at/frame_id, optional saved PNG, and texts with boxes. region=full|chat|bubble selects the OCR area.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "region": {"type": "string", "enum": ["full", "chat", "bubble"], "description": "OCR region: full frame (default), chat panel, or in-world chat bubbles.", "default": "full"},
+                "save_path": {"type": "string", "description": "Optional: save the captured PNG to this path (parent dirs created)."},
+            },
+        },
+    },
+    {
+        "name": "read_chat",
+        "description": "Read in-game chat and return structured messages (speaker/text/confidence/y/is_self/kind). Auto mode OCRs both the chat panel log and in-world bubbles, merges/dedupes by text and sorts by y. Returns ocr/ocr_error/ocr_ms/image_size/captured_at/frame_id/panel_open as well.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max recent messages (1-100).", "default": 20},
+                "mode": {"type": "string", "enum": ["auto", "panel", "bubble"], "description": "auto (panel then bubble), panel only, or bubble only.", "default": "auto"},
+                "save_path": {"type": "string", "description": "Optional: save the captured PNG to this path."},
+            },
+        },
     },
     {
         "name": "screenshot",
-        "description": "Capture the emulator screen and return it as a PNG image.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "Capture the emulator screen and return it as a PNG image. Also returns image metadata (image_size/captured_at/frame_id) and optional saved path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "save_path": {"type": "string", "description": "Optional: save the captured PNG to this path (parent dirs created)."},
+            },
+        },
     },
 ]
 
@@ -818,13 +1204,15 @@ class McpServer:
             result = self.controller.send_chat(
                 arguments["message"],
                 arguments.get("open_key", "enter"),
-                arguments.get("open_delay_ms", 180),
+                arguments.get("open_delay_ms", 500),
                 arguments.get("assume_open", False),
                 arguments.get("send", True),
                 arguments.get("enter_tap_ms", 35),
                 arguments.get("backend"),
+                arguments.get("verify", False),
             )
-            return {"content": text_content(result)}
+            return {"content": text_content(
+                json.dumps(result, ensure_ascii=False))}
         if name == "type_text":
             result = self.controller.type_text(
                 arguments["message"],
@@ -833,23 +1221,51 @@ class McpServer:
                 arguments.get("backend"),
                 arguments.get("require_foreground", True),
             )
-            return {"content": text_content(result)}
+            return {"content": text_content(
+                json.dumps(result, ensure_ascii=False))}
         if name == "read_screen":
-            # 只截一次屏：OCR 和返回的图片共用同一帧
-            png = self.controller.capture_png()
-            result = self.controller.read_screen(png=png)
+            # 只截一次屏：OCR 和返回的图片共用同一帧（同一 frame_id）
+            frame = self.controller.capture_frame()
+            result = self.controller.read_screen(
+                frame=frame,
+                region=arguments.get("region", "full"),
+                save_path=arguments.get("save_path"),
+            )
             text = json.dumps(result, ensure_ascii=False, indent=2)
             return {"content": [
                 {"type": "text", "text": text},
                 {"type": "image",
-                 "data": self.controller.screenshot_base64(png=png),
+                 "data": base64.b64encode(frame.png).decode("ascii"),
                  "mimeType": "image/png"},
             ]}
+        if name == "read_chat":
+            frame = self.controller.capture_frame()
+            result = self.controller.read_chat(
+                frame=frame,
+                limit=arguments.get("limit", 20),
+                mode=arguments.get("mode", "auto"),
+                save_path=arguments.get("save_path"),
+            )
+            return {"content": text_content(
+                json.dumps(result, ensure_ascii=False, indent=2))}
         if name == "screenshot":
-            data = self.controller.screenshot_base64()
+            frame = self.controller.capture_frame()
+            meta = {
+                "image_size": {"width": frame.width, "height": frame.height},
+                "captured_at": frame.captured_at,
+                "frame_id": frame.frame_id,
+            }
+            saved = self.controller.save_png(frame, arguments.get("save_path"))
+            if saved:
+                meta["saved_path"] = saved
             return {"content": [
-                {"type": "image", "data": data, "mimeType": "image/png"}]}
-        raise SkyError(f"Unknown tool: {name}")
+                {"type": "text",
+                 "text": json.dumps(meta, ensure_ascii=False)},
+                {"type": "image",
+                 "data": base64.b64encode(frame.png).decode("ascii"),
+                 "mimeType": "image/png"},
+            ]}
+        raise SkyError(f"Unknown tool: {name}", code="invalid")
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
         method = message.get("method")
@@ -883,13 +1299,31 @@ class McpServer:
                 "id": msg_id,
                 "error": {"code": -32601, "message": f"Unknown method: {method}"},
             }
-        except Exception as exc:
-            # 工具级错误走 isError（客户端应检查该字段，否则会当正常结果）
+        except SkyError as exc:
+            # 工具级错误走 isError + 结构化 error_type（R5：客户端可分类重试）
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"content": text_content(f"Error: {exc}"),
-                           "isError": True},
+                "result": {"content": text_content(json.dumps(
+                    exc.as_payload(), ensure_ascii=False)),
+                    "isError": True},
+            }
+        except AdbError as exc:
+            payload = {"ok": False, "error_type": "device", "error": str(exc)}
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"content": text_content(json.dumps(
+                    payload, ensure_ascii=False)), "isError": True},
+            }
+        except Exception as exc:
+            # 工具级错误走 isError（客户端应检查该字段，否则会当正常结果）
+            payload = {"ok": False, "error_type": "unknown", "error": str(exc)}
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"content": text_content(json.dumps(
+                    payload, ensure_ascii=False)), "isError": True},
             }
 
 
@@ -928,20 +1362,35 @@ def run_http(server: McpServer, config: ServerConfig) -> None:
     if config.host not in LOCAL_HOSTS and not config.token:
         raise SystemExit(
             "拒绝在未设置 --token 的情况下绑定非本机地址（httpx 远程调用需鉴权）。")
-    # 启动时就把 OCR 引擎探一遍：第一次 OCR 加载模型很慢，别让首个工具调用卡住
-    server.controller._detect_ocr_name()
+    # R3：启动时后台预热 OCR（第一次加载模型很慢，别让首个工具调用卡住）。
+    # 用后台线程 + status.ocr_ready 暴露进度；--no-ocr-prewarm 可关闭。
+    if config.ocr_prewarm:
+        def _prewarm():
+            try:
+                server.controller.prewarm_ocr()
+            except Exception as exc:  # 预热失败不影响服务，read_* 会给诊断
+                log(f"OCR 预热异常: {exc}")
+
+        threading.Thread(target=_prewarm, name="ocr-prewarm",
+                         daemon=True).start()
+        log("OCR 预热线程已启动（status.ocr_ready 可查进度）")
+    else:
+        log("OCR 预热已关闭：首次 read_screen/read_chat 会等待模型加载")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path != "/health":
                 self.send_error(404)
                 return
+            ocr = server.controller.ocr_status()
             body = json.dumps({
                 "status": "ok",
                 "server": SERVER_INFO,
                 "mode": "android-emulator",
-                "ocr": server.controller._detect_ocr_name(),
-                "ocr_device": server.controller._ocr_device,
+                "ocr": ocr.get("ocr", "none"),
+                "ocr_device": ocr.get("ocr_device", "unknown"),
+                "ocr_ready": bool(ocr.get("ocr_ready", False)),
+                "ocr_error": str(ocr.get("ocr_error") or ""),
             }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1050,6 +1499,14 @@ def parse_args() -> argparse.Namespace:
         "--screenshot-max-height", type=int,
         default=int(os.environ.get("SKY_SCREENSHOT_MAX_HEIGHT", "1080")),
         help="截图最大高度（只缩小不放大）。")
+    parser.add_argument(
+        "--ocr-engine",
+        choices=["auto", "paddleocr", "rapidocr", "tesseract", "none"],
+        default=os.environ.get("SKY_OCR_ENGINE", "auto"),
+        help="OCR 引擎（默认 auto：paddleocr→rapidocr→tesseract；也可用环境变量 SKY_OCR_ENGINE）。")
+    parser.add_argument(
+        "--no-ocr-prewarm", action="store_true",
+        help="HTTP 启动时不后台预热 OCR（默认预热，避免首个 read_screen 卡住）。")
     args = parser.parse_args()
     if args.http and args.http != "true":
         args.port = int(args.http)
@@ -1089,6 +1546,8 @@ def main() -> None:
             screenshot_max_width=args.screenshot_max_width,
             screenshot_max_height=args.screenshot_max_height,
             adb_config=adb_config,
+            ocr_engine=args.ocr_engine,
+            ocr_prewarm=not args.no_ocr_prewarm,
         )
         controller = AdbSkyController(config)
         # 启动时就校验后端，坏参数（旧 PC 后端名等）立刻给中文报错，

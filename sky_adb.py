@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """sky_adb.py — 光遇（安卓模拟器）ADB 按键/截屏驱动。
 
-纯标准库实现，不依赖 numpy / cv2，便于单独测试。
-MCP server（sky-mcp-server.py）、调试 CLI 与单元测试共用本模块。
+纯标准库实现，不依赖 numpy / cv2，便于单独运行/真机测试。
+MCP server（sky-mcp-server.py）、调试 CLI 与真机测试共用本模块。
 
 为什么不是 `adb shell input keyevent`？
     实测（MuMu 12 + 光遇国服 com.netease.sky）：`input keyevent` 注入的事件
@@ -204,7 +204,8 @@ class AdbDevice:
         dev.press_key("c", 150)      # 打开聊天面板
         pix, w, h = dev.screencap_raw()
 
-    测试时可以传 ``runner`` 注入假 adb 调用（见 tests/test_sky_adb.py）。
+    测试时可以传 ``runner`` 注入自定义 adb 调用实现（离线调试用；本仓库的测试
+    已改为真机测试，直接连接真实模拟器，不再使用假 adb）。
     """
 
     def __init__(self, config: AdbConfig | None = None, runner=None):
@@ -698,6 +699,79 @@ class AdbDevice:
             return self.default_ime() == self.cfg.ime_component
         except AdbError:
             return False
+
+    def ime_process_alive(self) -> bool:
+        """ADBKeyboard 进程是否还活着（崩溃后 pidof 为空）。
+
+        真机踩坑：输入框还没聚焦时就广播 ADB_INPUT_B64/ADB_CLEAR_TEXT，部分
+        ADBKeyboard 版本会 NPE 崩溃（系统弹「屡次停止运行」），之后所有广播
+        都被静默丢弃——表现就是“回执 ok 但消息没发出去”。所以每次输入前查一次。
+        """
+        try:
+            output = self.shell_text("pidof com.android.adbkeyboard", timeout=8.0)
+        except AdbError:
+            return True  # 查不到别误判，按健康处理
+        return bool(output.strip())
+
+    def input_connection_active(self) -> bool:
+        """当前是否有真实的文本输入连接（游戏聊天框是否已聚焦）。
+
+        真机踩坑：输入框还没拿到 InputConnection 时广播 ADB_INPUT_B64 /
+        ADB_CLEAR_TEXT，ADBKeyboard 会因为 getCurrentInputConnection() 为 null
+        直接 NPE 崩溃（系统弹「屡次停止运行」），之后的广播全部静默丢弃。
+        所以打字前用 dumpsys input_method 确认输入连接真的建立了。
+        """
+        try:
+            output = self.shell_text(
+                "dumpsys input_method | grep -E "
+                "'mServedInputConnectionWrapper|mInputShown'", timeout=8.0)
+        except AdbError:
+            return True  # 查不到就当可用，别因为检测失败反而阻塞输入
+        for line in output.splitlines():
+            line = line.strip()
+            if not line.startswith("mServedInputConnectionWrapper="):
+                continue
+            value = line.split("=", 1)[1].strip().lower()
+            return value not in ("null", "", "none")
+        return False
+
+    def wait_input_connection(self, timeout: float = 3.0) -> bool:
+        """等聊天输入框建立输入连接；超时返回 False（调用方给 ime 错误）。"""
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            if self.input_connection_active():
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.15)
+
+    def ensure_ime_healthy(self) -> str:
+        """确保 ADBKeyboard 进程活着；崩过就清对话框并重新绑定 IME。"""
+        self.ensure_adb_ime()
+        if self.ime_process_alive():
+            return "ime ok"
+        self._log("ADBKeyboard 进程不在了（可能崩溃），尝试重绑输入法…")
+        try:
+            # 先清掉崩溃后残留的「屡次停止运行」对话框，否则它会挡住游戏输入
+            self.shell("am force-stop com.android.adbkeyboard", timeout=10.0)
+        except AdbError:
+            pass
+        try:
+            self.shell(f"ime disable {self.cfg.ime_component}", timeout=10.0)
+        except AdbError:
+            pass
+        self.shell(f"ime enable {self.cfg.ime_component}", timeout=10.0)
+        self.shell(f"ime set {self.cfg.ime_component}", timeout=10.0)
+        self._ime_switched = True
+        time.sleep(0.6)  # 等 InputMethodService 重新绑定
+        for _ in range(20):
+            if self.adb_ime_active():
+                self._log("ADBKeyboard 已重新绑定")
+                return "ime rebound after crash"
+            time.sleep(0.1)
+        raise AdbError(
+            "ADBKeyboard 输入法进程异常（崩溃/未启动），自动重绑失败。"
+            "中文输入需要它：请重启模拟器或重装 ADBKeyboard.apk 后重试。")
 
     def ensure_adb_ime(self) -> None:
         """切到 ADBKeyboard 输入法（中文输入的前提）。只切一次，退出时还原。"""

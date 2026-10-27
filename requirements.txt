@@ -1,8 +1,8 @@
+rapidocr-onnxruntime>=1.2,<2
 numpy
 opencv-python
 
-# PaddleOCR 或 Tesseract：read_screen 的 OCR 引擎（二选一，惰性导入）；
-# 都不装时 read_screen 仍返回截图，只是 texts 里给一条"未安装 OCR 引擎"提示。
+# 其他 OCR 引擎（按探测顺序 paddleocr → rapidocr → tesseract）：
 # paddleocr
 # paddlepaddle
 # pytesseract

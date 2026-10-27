@@ -1,17 +1,25 @@
-*.png
-*.jpg
-debug_out/
-
-# 开发环境与临时文件
-.venv/
-vendor/
-.tmp/
-tests/.tmp_config/
-__pycache__/
-*.pyc
-.DS_Store
-
 # 本机运行配置（含 MCP token）；模板见 sky_config.example.json
 sky_config.json
 # 本机 adb 配置（共享配置见 adb_config.example.json）
 adb_config.json
+
+# 截图/OCR 调试输出（含聊天内容，永不上传）
+debug_out/
+# 仓库内的临时截图
+/*.png
+/*.jpg
+
+# OCR 运行时兜底目录（本地 wheel 解包）与开发环境
+.deps/
+.venv/
+vendor/
+.tmp/
+tests/.tmp_config/
+tests/.tmp_out/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 只保留测试代码
+tests/*
+!tests/*.py
