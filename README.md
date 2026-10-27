@@ -172,7 +172,11 @@ Value:  Bearer 1234
 - `status.ocr`：实际/首选引擎名（`rapidocr`、`paddleocr-mobile-cpu`、`tesseract`、`none`）；
 - `status.ocr_error`：探测/加载失败的**可操作原因**（缺哪个包/模型/可执行文件），不再静默 `none`；
 - `status.ocr_ready`：模型是否已加载（HTTP 启动默认后台预热，`--no-ocr-prewarm` 可关）；
-- `read_screen.texts`：引擎可用时是真实文本（含 `x/y/width/height/confidence`），不可用时为空 + `ocr_error`。
+- `read_screen.texts`：引擎可用时是真实文本（含 `x/y/width/height/confidence`），不可用时为空 + `ocr_error`；
+- `read_screen.fallback_used` / `fallback_attempted`：全屏 `default` 只读出
+  **1~2 个碎片**（角色移动/转场帧）时，自动用 `preprocess=none` 重试一次；
+  回退后文字更多才采用（`fallback_used=true`），尝试过但没变好记
+  `fallback_attempted=true`；0 文字场景不会白跑第二遍（R3-1）。
 
 ### 读聊天（R2）
 
@@ -193,20 +197,26 @@ Value:  Bearer 1234
   "ocr": "rapidocr", "ocr_device": "cpu", "ocr_error": "", "ocr_ready": true,
   "ocr_ms": 4200.5, "image_size": {"width": 3200, "height": 1800},
   "captured_at": "2026-10-27T17:31:02.000+08:00", "frame_id": "18f...-ab12",
-  "region": "chat+bubble", "mode": "auto", "panel_open": true
+  "region": "chat+bubble", "mode": "auto", "panel_open": true,
+  "bubble_region_px": [115, 454, 691, 540], "fullscreen_scan": false
 }
 ```
 
 - 读取前请确保聊天面板开着（AI 可以先调 `press_key c` 或 `open_chat`）；
 - `mode=auto`：**同时 OCR 聊天面板（左列带名字的消息）和世界气泡（发送后叠在
-  输入框上方的消息，聊天界面开着时不会消失），两路按文本去重、按 y 排序后合并**；
+  输入框上方的消息，聊天界面开着时不会消失），多路按文本去重、按 y 排序后合并**；
   `mode=panel / bubble` 只读对应区域（各一遍 OCR，更快）；
+- **头顶漂浮气泡（R2-1）**：气泡不一定在左下固定 ROI，也可能飘在角色头顶
+  （1920x1080 实测可达 `x≈1112,y≈418`）。所以 `mode=bubble` 总会补一次
+  **全屏气泡扫描**（真实全屏 OCR → 排除聊天面板/底部横幅 → 保留像聊天正文的文本）；
+  `mode=auto` 在「左下没气泡」或「最近 120s 自己发的消息还没匹配到」时补扫。
+  返回 `bubble_region_px`（左下 ROI 绝对像素）和 `fullscreen_scan`（是否补扫）便于诊断；
 - 光遇不显示自己的名字：无名字行按 x 位置/历史发送记录标 `is_self=true`；
   server 会把最近 10 分钟 `send_chat` 发过的文本作为证据（`own_texts`）提高判断准确率；
 - 面板里 OCR 只剩「陌生人/图像」等名字/菜单碎片的行、单字符残片会被过滤掉；
 - 同一帧反复调用结果稳定；`limit` 取最近 N 条后仍按 y 从上到下排序；
-- `auto` 两遍 OCR 约 4~5s（CPU rapidocr），要更低延迟可用 `mode=panel` 或
-  `mode=bubble`。
+- `auto` 常规两遍 OCR 约 4~5s；触发全屏气泡兜底时约 6~7s（CPU rapidocr）。
+  要更低延迟可用 `mode=panel`（只读面板）。
 
 ### 帧元数据与保存（R4）
 
@@ -272,7 +282,7 @@ OCR 相关：`--ocr-engine` 或 `SKY_OCR_ENGINE`；`--no-ocr-prewarm` 关闭启�
   1920x1080 空白图各跑一遍 full/chat 区域，让 onnxruntime 完成首帧图优化），
   用 `status.ocr_ready` 暴露进度；首个 `read_screen` 不被拖住。
 - **OCR 工作图上限**：截图先按 `screenshot_scale/max` 缩到 ≤1920x1080，OCR 预处理再
-  按模式限最长边（default ≤1900、chat ≤2000）；再大只会变慢，识别条数并不会变多。
+  按模式限最长边（default ≤1700、chat ≤2000）；再大只会变慢，识别条数并不会变多。
 - **聊天判读**：面板行格式是「内容 - 名字」；自己发的消息没有名字。`read_chat` 同时
   读面板与输入框上方的世界气泡，合并去重并过滤「陌生人/图像」这类名字/菜单碎片。
 - **发送回执可验证**：默认不验证（快）；关键消息可传 `verify=true`，发完自动回读，
@@ -328,8 +338,9 @@ python tools\mcp_acceptance.py
 python tools\mcp_acceptance.py --send-chat "测试ABC123" --send-chat "OCR验收2"
 ```
 
-- 只读模式约 40~60s；带 5 条真实发送约 110s（R2-4 回读、R3-3 识别率、R5-1 回执）。
-- 验收报告和截图落在 `debug_out/`（已 gitignore，含聊天内容不要外传）。
+- 只读模式约 50~70s；带 5 条真实发送约 150~180s（R2-4 回读、R3-3 识别率、R5-1 回执）。
+- 共 25 项检查（R3-5 覆盖 `fallback_used`/`fallback_attempted`）；报告和截图落在
+  `debug_out/`（已 gitignore，含聊天内容不要外传）。
 - OCR 运行时依赖可用 `python tools\ocr_env.py` 手工检测/安装（开发机兜底用）。
 
 目录：

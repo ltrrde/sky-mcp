@@ -81,6 +81,28 @@ class TestRealChatParsing(unittest.TestCase):
         self.assertTrue("沐子" in joined or "小光" in joined,
                         f"真实气泡文本不符合预期: {joined}")
 
+    def test_parse_floating_bubbles_from_real_fullscreen_ocr(self):
+        # R2-1：全屏真实 OCR 里的头顶/漂浮气泡要被识别出来（不只左下 ROI）
+        result = self.engine.run(self.fixtures["chat_panel"])  # 真实全屏 OCR
+        items = result.texts()
+        self.assertGreater(len(items), 2, "全屏真实 OCR 文字太少，无法验证")
+        floating = sky_chat.parse_floating_bubbles(
+            items, image_size=self.image_size)
+        joined = "".join(message["text"] for message in floating)
+        self.assertIn("沐子", joined, f"全屏气泡未识别出「沐子…」: {joined!r}")
+        self.assertIn("小光", joined, f"全屏气泡未识别出「小光…」: {joined!r}")
+        self.assertTrue(all(message["kind"] == "bubble"
+                            for message in floating))
+        self.assert_message_shape(floating)
+
+        # 自己刚发的文本在气泡里 → is_self=True
+        own = sky_chat.parse_floating_bubbles(
+            items, own_texts=("小光来啦，测试一下聊天",),
+            image_size=self.image_size)
+        own_messages = [message for message in own if "小光" in message["text"]]
+        self.assertTrue(own_messages)
+        self.assertTrue(all(message["is_self"] for message in own_messages))
+
     def test_invalid_mode_rejected_by_real_parser(self):
         with self.assertRaises(ValueError):
             sky_chat.parse_chat_items([], mode="bogus")

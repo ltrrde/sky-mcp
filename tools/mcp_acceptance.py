@@ -1211,19 +1211,56 @@ class Acceptance:
         ocr_ms = payload.get("ocr_ms")
         elapsed = self.read_screen.elapsed_ms if self.read_screen else 0.0
         limit = self.args.max_ocr_ms
+        fallback_used = bool(payload.get("fallback_used"))
+        fallback_attempted = bool(payload.get("fallback_attempted"))
+        # R3-1：全屏少字时 read_screen 会用 preprocess=none 再跑一遍，
+        # 此时 ocr_ms 是两遍之和；给回退额外预算，正常路径仍按单遍 3s 评。
+        fallback_budget = 1500.0 if (fallback_used or fallback_attempted) else 0.0
+        effective_limit = limit + fallback_budget
         data = {"ocr_ms": ocr_ms, "http_total_ms": round(elapsed or 0, 1),
-                "limit_ms": limit}
+                "limit_ms": limit, "fallback_used": fallback_used,
+                "fallback_attempted": fallback_attempted,
+                "fallback_budget_ms": fallback_budget,
+                "effective_limit_ms": effective_limit}
         prewarmed = bool(self.args.ocr_ready_before_first_call)
         if not isinstance(ocr_ms, (int, float)):
             return FAIL, "read_screen 没有 ocr_ms，无法评估耗时", data
         problems = []
-        if ocr_ms > limit:
-            problems.append(f"OCR {ocr_ms}ms > {limit}ms")
+        if ocr_ms > effective_limit:
+            problems.append(f"OCR {ocr_ms}ms > {effective_limit}ms")
         data["prewarmed"] = prewarmed
         if problems:
             return FAIL, "；".join(problems), data
-        return PASS, (f"OCR {ocr_ms}ms ≤ {limit}ms；HTTP 总耗时 "
+        return PASS, (f"OCR {ocr_ms}ms ≤ {effective_limit}ms"
+                      f"（fallback_used={fallback_used}）；HTTP 总耗时 "
                       f"{elapsed:.0f}ms（预热={prewarmed}）"), data
+
+    def check_r3_5_fallback_field(self) -> tuple[str, str, dict]:
+        """R3-1：read_screen 必须暴露少字回退状态，回退时 preprocess 应为 none。"""
+        payload = (self.read_screen.payload if self.read_screen else {}) or {}
+        if not payload:
+            return FAIL, "没有 read_screen 结果，无法检查 fallback_used", {}
+        data = {
+            "fallback_used": payload.get("fallback_used"),
+            "preprocess": payload.get("preprocess"),
+            "ocr_ms": payload.get("ocr_ms"),
+            "texts_count": len(payload.get("texts") or []),
+        }
+        if "fallback_used" not in payload:
+            return FAIL, "read_screen 缺少 fallback_used 字段", data
+        if not isinstance(payload.get("fallback_used"), bool):
+            return FAIL, "fallback_used 不是 bool", data
+        if payload["fallback_used"] and payload.get("preprocess") != "none":
+            return FAIL, (f"fallback_used=true 但 preprocess="
+                          f"{payload.get('preprocess')!r}"), data
+        if not payload["fallback_used"] and payload.get("preprocess") not in (
+                "default", "chat", "none"):
+            return FAIL, (f"未知 preprocess={payload.get('preprocess')!r}"), data
+        return PASS, (f"fallback_used={payload['fallback_used']}，"
+                      f"fallback_attempted="
+                      f"{payload.get('fallback_attempted')}，"
+                      f"preprocess={payload.get('preprocess')}，"
+                      f"texts={data['texts_count']}"), data
 
     def check_r3_4_prewarm(self) -> tuple[str, str, dict]:
         # 预热等待在 prewarm_wait() 里完成，这里只做结论
@@ -1534,6 +1571,8 @@ class Acceptance:
         self.run_check("R3-1", "read_screen/read_chat 返回 ocr_ms",
                        self.check_r3_1_ocr_ms)
         self.run_check("R3-2", "OCR 单次耗时 ≤ 上限", self.check_r3_2_latency)
+        self.run_check("R3-5", "少字回退状态 fallback_used（R3-1）",
+                       self.check_r3_5_fallback_field)
         self.log("\n-- R5 send_chat 回执 / R2 发送回读 --")
         self.run_check("R5-2", "send_chat 失败路径 error_type",
                        self.check_r5_2_error_shape)

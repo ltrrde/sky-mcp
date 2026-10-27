@@ -97,6 +97,12 @@ class TestRealMcpTools(unittest.TestCase):
         self.assertTrue(payload["frame_id"])
         self.assertTrue(payload["captured_at"])
         self.assertEqual(payload["region"], "full")
+        self.assertIn("fallback_used", payload)
+        self.assertIsInstance(payload["fallback_used"], bool)
+        self.assertIn("fallback_attempted", payload)
+        self.assertIsInstance(payload["fallback_attempted"], bool)
+        if payload["fallback_used"]:
+            self.assertEqual(payload["preprocess"], "none")
         self.assertIsInstance(payload["texts"], list)
         self.assertEqual(
             self.server.AdbSkyController._png_size(
@@ -126,6 +132,8 @@ class TestRealMcpTools(unittest.TestCase):
         self.assertGreater(payload["ocr_ms"], 0.0)
         self.assertIn("chat", payload["region"])
         self.assertIs(payload["panel_open"], True)
+        self.assertEqual(len(payload["bubble_region_px"]), 4)
+        self.assertIsInstance(payload["fullscreen_scan"], bool)
         self.assertIsInstance(payload["messages"], list)
         for message in payload["messages"]:
             for field in ("speaker", "text", "confidence", "y",
@@ -174,6 +182,49 @@ class TestRealMcpTools(unittest.TestCase):
                              for message in payload["messages"])
             self.assertIn(marker, joined,
                           f"发送后 read_chat 找不到 {marker!r}: {joined!r}")
+
+    def _read_chat_until(self, marker, mode, attempts=3):
+        """发送后回读（气泡渲染/全屏 OCR 都有延迟，允许 1~2s 内重试几次）。"""
+        payload = {}
+        for _ in range(attempts):
+            time.sleep(1.2)
+            payload = json.loads(result_text(
+                call_tool(self.mcp, "read_chat", limit=10, mode=mode)))
+            joined = "".join(str(message.get("text") or "")
+                             for message in payload.get("messages") or [])
+            if marker in joined:
+                return payload
+        return payload
+
+    def test_floating_bubble_read_chat_auto(self):
+        # R2-1 验收：面板关闭时发送，消息以角色头顶气泡出现（不在左下固定 ROI），
+        # read_chat(mode=auto) 必须在发送后同一帧读到（全屏兜底扫描）。
+        self.env.ensure_panel_closed()
+        marker = f"auto{int(time.time() * 1000) % 10000000}"
+        result = call_tool(self.mcp, "send_chat", message=marker)
+        self.assertFalse(result.get("isError"), result_text(result))
+        payload = self._read_chat_until(marker, "auto")
+        joined = "".join(str(message.get("text") or "")
+                         for message in payload["messages"])
+        self.assertIn(marker, joined,
+                      f"头顶气泡未读到 {marker!r}: {joined!r}；"
+                      f"region={payload.get('region')}，"
+                      f"fullscreen_scan={payload.get('fullscreen_scan')}")
+        self.assertTrue(payload["fullscreen_scan"])
+
+    def test_floating_bubble_read_chat_bubble_mode(self):
+        self.env.ensure_panel_closed()
+        marker = f"bub{int(time.time() * 1000) % 10000000}"
+        result = call_tool(self.mcp, "send_chat", message=marker)
+        self.assertFalse(result.get("isError"), result_text(result))
+        payload = self._read_chat_until(marker, "bubble")
+        joined = "".join(str(message.get("text") or "")
+                         for message in payload["messages"])
+        self.assertIn(marker, joined,
+                      f"bubble 模式未读到头顶气泡 {marker!r}: {joined!r}；"
+                      f"region={payload.get('region')}")
+        self.assertTrue(payload["fullscreen_scan"])
+        self.assertIn("fullscreen", payload["region"])
 
     def test_zz_foreground_guard_blocks_real_input(self):
         # 真机切到系统设置 → 前台守卫必须拒绝按键 → focus_game 拉回游戏

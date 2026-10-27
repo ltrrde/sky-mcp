@@ -79,7 +79,7 @@ from sky_adb import (
     normalize_key as _normalize_adb_key,
 )
 from sky_chat import (bubble_region, chat_region, panel_looks_open,
-                      parse_chat_items)
+                      parse_chat_items, parse_floating_bubbles)
 from sky_config import ConfigError, default_config, load_config as load_sky_config
 from sky_ocr import OcrEngine, OcrError
 
@@ -101,6 +101,11 @@ REMOVED_BACKENDS: dict[str, str] = {
 
 #: 聊天消息长度上限（和旧版一致，避免一条消息把输入框/广播打爆）
 MAX_CHAT_CHARS = 240
+
+#: read_screen 全屏 OCR 的「文字过少」回退阈值（需求 R3-1）：
+#: 角色移动/转场帧上 default 预处理可能只读出 1~2 个碎片，此时用
+#: preprocess=none 再试一次；回退生效时结果里 fallback_used=true。
+OCR_FALLBACK_MIN_TEXTS = 2
 
 
 class SkyError(RuntimeError):
@@ -767,11 +772,17 @@ class AdbSkyController:
             f"未知 region={region!r}（可用: full / chat / bubble）",
             code="invalid")
 
-    def _ocr_frame(self, frame: CapturedFrame, region: Any):
-        """对一帧做 OCR。返回 (OcrResult|None, region名, preprocess, error)。"""
+    def _ocr_frame(self, frame: CapturedFrame, region: Any,
+                   preprocess: str | None = None):
+        """对一帧做 OCR。返回 (OcrResult|None, region名, preprocess, error)。
+
+        ``preprocess`` 显式传入时覆盖默认值（R3-1 的 none 回退用）。
+        """
         region_px, region_name = self._region_for(
             region, (frame.width, frame.height))
-        preprocess = "chat" if region_name in ("chat", "bubble") else "default"
+        if preprocess is None:
+            preprocess = ("chat" if region_name in ("chat", "bubble")
+                          else "default")
         try:
             result = self.ocr_engine.run(
                 frame.png, region=region_px, preprocess=preprocess)
@@ -780,6 +791,32 @@ class AdbSkyController:
             return None, region_name, preprocess, str(exc)
         except Exception as exc:  # 兜住引擎内部意外，工具不 500
             return None, region_name, preprocess, f"OCR 失败: {exc}"
+
+    #: 聊天输入框条带（相对坐标）：面板/输入 UI 打开时，底部左下会出现
+    #: 输入框 + 占位符「聊天......」。聊天列表为空（附近没人说话）时，
+    #: 仅靠聊天 ROI 的文字启发式判不出面板状态，用这条带兜底。
+    _CHAT_INPUT_STRIP_REL = (0.0, 0.88, 0.42, 0.12)
+
+    def _chat_input_visible(self, frame: CapturedFrame) -> tuple[bool | None, float]:
+        """检测底部聊天输入框条带是否可见。返回 (可见?, 这次 OCR 的 ocr_ms)。"""
+        top = int(frame.height * self._CHAT_INPUT_STRIP_REL[1])
+        region = (
+            0,
+            top,
+            max(1, int(frame.width * self._CHAT_INPUT_STRIP_REL[2])),
+            max(1, frame.height - top),
+        )
+        try:
+            result = self.ocr_engine.run(
+                frame.png, region=region, preprocess="chat")
+        except Exception:
+            return None, 0.0
+        for item in result.items:
+            normalized = re.sub(r"[\s\W_]+", "", item.text or "")
+            if (normalized.startswith("聊天")
+                    or normalized in ("发送", "语音输入", "说点什么")):
+                return True, float(result.ocr_ms)
+        return False, float(result.ocr_ms)
 
     def read_screen(self, png: bytes | None = None, *,
                     region: str = "full",
@@ -794,6 +831,24 @@ class AdbSkyController:
         status = self.ocr_status()
         result, region_name, preprocess, ocr_error = self._ocr_frame(
             frame, region)
+        ocr_ms = float(result.ocr_ms) if result else 0.0
+        fallback_attempted = False
+        fallback_used = False
+        # R3-1：全屏 default 只读出 1~2 个碎片（角色移动/转场帧）时，用
+        # preprocess=none 再试一次；0 文字（纯图形场景）不触发，避免白白多跑一趟。
+        # 只有「回退后文字更多」才采用回退结果（fallback_used=true）；
+        # 尝试过但没变好也会记 fallback_attempted（ocr_ms 已含两遍耗时）。
+        if (result is not None and region_name == "full"
+                and preprocess == "default"
+                and 0 < len(result.items) <= OCR_FALLBACK_MIN_TEXTS):
+            fallback_attempted = True
+            alt, _alt_name, alt_pre, _alt_err = self._ocr_frame(
+                frame, region, preprocess="none")
+            if alt is not None:
+                ocr_ms += float(alt.ocr_ms)
+                if len(alt.items) > len(result.items):
+                    result, preprocess, fallback_used = alt, alt_pre, True
+                    ocr_error = ""
         payload: dict[str, Any] = {
             "ocr": status.get("ocr", "none"),
             "ocr_engine": status.get("ocr_engine", status.get("ocr", "none")),
@@ -805,7 +860,9 @@ class AdbSkyController:
             "frame_id": frame.frame_id,
             "region": region_name,
             "preprocess": preprocess,
-            "ocr_ms": round(float(result.ocr_ms), 1) if result else 0.0,
+            "fallback_used": fallback_used,
+            "fallback_attempted": fallback_attempted,
+            "ocr_ms": round(ocr_ms, 1),
             "texts": result.texts() if result else [],
         }
         saved = self.save_png(frame, save_path)
@@ -954,12 +1011,16 @@ class AdbSkyController:
         frame = self._as_frame(png, frame)
         status = self.ocr_status()
         own_texts = self._recent_sent_texts()
+        screen_size = (frame.width, frame.height)
 
+        panel_messages: list[dict[str, Any]] = []
+        bubble_messages: list[dict[str, Any]] = []
         groups: list[list[dict[str, Any]]] = []
         used: list[str] = []
         errors: list[str] = []
         ocr_ms = 0.0
         panel_open: bool | None = None
+        fullscreen_scan = False
 
         if mode in ("auto", "panel"):
             result, _name, _pre, err = self._ocr_frame(frame, "chat")
@@ -969,11 +1030,19 @@ class AdbSkyController:
                 texts = result.texts()
                 ocr_ms += float(result.ocr_ms)
                 used.append("chat")
-                panel_open = panel_looks_open(
-                    texts, (frame.width, frame.height))
-                groups.append(parse_chat_items(
+                panel_open = panel_looks_open(texts, screen_size)
+                panel_messages = parse_chat_items(
                     texts, own_texts=own_texts, mode="panel", limit=limit,
-                    image_size=(frame.width, frame.height)))
+                    image_size=screen_size)
+        # 聊天列表为空时（附近没人说话），文字启发式返回 None/False；
+        # 用底部输入框占位「聊天......」再确认一次，避免误报"面板没开"。
+        if panel_open is not True and mode in ("auto", "panel"):
+            visible, extra_ms = self._chat_input_visible(frame)
+            if extra_ms:
+                ocr_ms += extra_ms
+                used.append("inputbar")
+            if visible is True:
+                panel_open = True
         if mode in ("auto", "bubble"):
             result, _name, _pre, err = self._ocr_frame(frame, "bubble")
             if err:
@@ -981,12 +1050,46 @@ class AdbSkyController:
             if result is not None:
                 ocr_ms += float(result.ocr_ms)
                 used.append("bubble")
-                groups.append(parse_chat_items(
+                bubble_messages = parse_chat_items(
                     result.texts(), own_texts=own_texts,
-                    mode="bubble", limit=limit,
-                    image_size=(frame.width, frame.height)))
+                    mode="bubble", limit=limit, image_size=screen_size)
+        groups = [panel_messages, bubble_messages]
 
-        messages = self._merge_chat_messages(groups, own_texts, limit)
+        # R2-1：气泡不只在左下 ROI，也可能飘在角色头顶（全屏任意位置）。
+        # - mode=bubble：总是补一次全屏扫描（固定 ROI 保证不了头顶气泡）；
+        # - mode=auto：只有「左下气泡一路没读到」或「最近 120s 发送的文本还没被
+        #   匹配到」时才补扫描，避免每次 read_chat 都多花一次全屏 OCR。
+        partial = self._merge_chat_messages(groups, own_texts, limit)
+        now = time.time()
+        with self._send_lock:
+            recent_own = [text for text, ts in self._sent_history
+                          if now - ts < 120.0]
+        unmatched_recent = [
+            text for text in recent_own
+            if not any(self._looks_like_own(message.get("text", ""), [text])
+                       for message in partial)
+        ]
+        bubble_found = any(message.get("kind") == "bubble"
+                           for message in partial)
+        need_fullscreen = (mode == "bubble"
+                           or (mode == "auto"
+                               and (not bubble_found or bool(unmatched_recent))))
+        floating_messages: list[dict[str, Any]] = []
+        if need_fullscreen:
+            result, _name, _pre, err = self._ocr_frame(frame, "full")
+            if err:
+                errors.append(err)
+            if result is not None:
+                ocr_ms += float(result.ocr_ms)
+                used.append("fullscreen")
+                fullscreen_scan = True
+                floating_messages = parse_floating_bubbles(
+                    result.texts(), own_texts=own_texts,
+                    image_size=screen_size, limit=limit)
+
+        messages = self._merge_chat_messages(
+            [panel_messages, bubble_messages, floating_messages],
+            own_texts, limit)
 
         payload: dict[str, Any] = {
             "messages": messages,
@@ -1002,6 +1105,9 @@ class AdbSkyController:
             "region": "+".join(used) if used else "none",
             "mode": mode,
             "panel_open": panel_open,
+            # R2-1：给客户端诊断「气泡 ROI 到底扫哪里 / 是否做了全屏兜底扫描」
+            "bubble_region_px": list(bubble_region(screen_size)),
+            "fullscreen_scan": fullscreen_scan,
         }
         saved = self.save_png(frame, save_path)
         if saved:
@@ -1141,7 +1247,7 @@ TOOLS = [
     },
     {
         "name": "read_screen",
-        "description": "Capture the emulator screen and OCR visible text. Returns ocr engine info, ocr_error diagnostics, ocr_ms, image_size/captured_at/frame_id, optional saved PNG, and texts with boxes. region=full|chat|bubble selects the OCR area.",
+        "description": "Capture the emulator screen and OCR visible text. Returns ocr engine info, ocr_error diagnostics, ocr_ms, image_size/captured_at/frame_id, fallback_used (auto retry with preprocess=none when a full-frame default pass finds <=2 fragments), optional saved PNG, and texts with boxes. region=full|chat|bubble selects the OCR area.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1152,7 +1258,7 @@ TOOLS = [
     },
     {
         "name": "read_chat",
-        "description": "Read in-game chat and return structured messages (speaker/text/confidence/y/is_self/kind). Auto mode OCRs both the chat panel log and in-world bubbles, merges/dedupes by text and sorts by y. Returns ocr/ocr_error/ocr_ms/image_size/captured_at/frame_id/panel_open as well.",
+        "description": "Read in-game chat and return structured messages (speaker/text/confidence/y/is_self/kind). Auto mode OCRs the chat panel, the left-bottom bubble ROI, and (when needed) a full-screen scan for floating bubbles above characters; merges/dedupes by text and sorts by y. Returns ocr/ocr_error/ocr_ms/image_size/captured_at/frame_id/panel_open/bubble_region_px/fullscreen_scan as well.",
         "inputSchema": {
             "type": "object",
             "properties": {

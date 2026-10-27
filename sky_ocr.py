@@ -80,12 +80,13 @@ _PREPROCESS_SCALE: dict[str, float] = {"default": 2.0, "chat": 2.5, "none": 1.0}
 #: 工作图最长边上限（按 preprocess 模式）：放大后超过就等比压回。
 #: Lead 实测建议（R3 性能）：3200x1800 截图做 default(2x) 是 6400x3600、
 #: 聊天 ROI 1088x1610 做 chat(2.5x) 是 2720x4025，rapidocr 都会很慢且占内存。
-#: 因此 crop 后放大时限制：default ≤1900、chat ≤2000；none 一般 1:1，
+#: 因此 crop 后放大时限制：default ≤1700、chat ≤2000；none 一般 1:1，
 #: 显式 scale 时用 5120 防超大图。实际生效缩放记录在坐标反算里。
-#: （1900 是 Lead 在 1920x1080 真机帧上实测的平衡点：识别条数不变，
-#:   预热后单次 OCR 约 1.2~1.5s；2100/2400 时偶发 >3s 会让 R3 验收抖动。）
+#: （1700 是 Lead 在 1920x1080 真机帧上实测的平衡点：识别条数不变，
+#:   预热后单次 OCR 约 1.0~1.3s；2100/2400 时偶发 >3s 会让 R3 验收抖动，
+#:   1900 在机器繁忙时仍偶发 3s+，再降一档留余量。）
 _MAX_WORK_SIDE_BY_MODE: dict[str, int] = {
-    "default": 1900,
+    "default": 1700,
     "chat": 2000,
     "none": 5120,
 }

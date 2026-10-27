@@ -865,6 +865,76 @@ def parse_chat_items(items: list[dict], *,
     return _finalize(messages, limit)
 
 
+#: 全屏气泡扫描的排除区域（相对坐标 x,y,w,h）：
+#:  - 左上聊天面板列表区（面板行本身有落款会被过滤，这里排除裸行/输入框噪音）；
+#:  - 屏幕最底部 10%（系统横幅「珍珠季的新任务现已开启」/输入框条带/手势条）。
+#: 头顶漂浮气泡一般在画面中上部角色附近，不会落进这两块。
+FULLSCREEN_EXCLUDE_REL: tuple[tuple[float, float, float, float], ...] = (
+    (0.0, 0.0, 0.35, 0.78),
+    (0.0, 0.90, 1.0, 0.10),
+)
+
+
+def parse_floating_bubbles(items: list[dict], *,
+                           own_texts: tuple[str, ...] | list[str] = (),
+                           image_size: tuple[int, int] | dict | None = None,
+                           limit: int = 20) -> list[dict]:
+    """从**全屏** OCR 结果里挑出「角色头顶漂浮的聊天气泡」（R2-1）。
+
+    与 ``parse_chat_items(mode="bubble")`` 的区别：后者只认左下固定 ROI
+    （覆盖输入框上方的气泡堆叠），而真机实测气泡也会出现在画面中上部角色头顶
+    （需求文档复现：1920x1080 时约 ``x=1112, y=418``），固定 ROI 覆盖不到。
+
+    筛选规则（宁可少收，不把系统 UI 文本当成聊天气泡）：
+    - 排除 ``FULLSCREEN_EXCLUDE_REL`` 两块 UI 区域（聊天面板列 / 底部横幅条带），
+      但与 ``own_texts`` 相似的文本即使落在排除区也保留（自己刚发的消息）；
+    - 丢弃带落款的面板行、UI 噪音（聊天/发送/菜单词）、名字碎片
+      （陌生人/光之子/玩家/旅人）、单字符/纯标点/纯数字；
+    - 与 ``own_texts`` 高度相似的 → ``is_self=True``（自己头顶的气泡）；
+    - 其余像聊天正文的文本 → ``is_self=False``（附近玩家头顶的气泡）；
+    - 返回字段与 ``parse_chat_items`` 一致，``kind="bubble"``，按 y 升序去重。
+    """
+    own = own_texts or ()
+    if isinstance(own, str):  # 容错：误传单条字符串时当成一条
+        own = (own,)
+    rows = _prepare_rows(items)
+    if not rows:
+        return []
+
+    excluded: list[tuple[int, int, int, int]] = []
+    if image_size is not None:
+        try:
+            excluded = [_rel_to_abs(rel, image_size)
+                        for rel in FULLSCREEN_EXCLUDE_REL]
+        except (TypeError, ValueError):
+            excluded = []
+
+    messages: list[dict] = []
+    for row in rows:
+        text = row["text"]
+        raw = str(text).strip()
+        normalized = _normalize_text(raw)
+        _content, speaker = _split_speaker(text)
+        if speaker is not None:
+            continue  # 「内容 - 名字」是聊天面板行，不可能是漂浮气泡
+        if (len(raw) < BUBBLE_MIN_TEXT_LEN
+                or len(normalized) < BUBBLE_MIN_TEXT_LEN
+                or _is_noise_text(text)
+                or _is_skip_text(text)
+                or _is_separator_only(text)
+                or _is_name_noise(text, allow_short_cjk=False)):
+            continue
+        own_match = _similar_to_own(raw, own)
+        if not own_match and any(
+                x <= row["x"] < x + width and y <= row["y"] < y + height
+                for x, y, width, height in excluded):
+            continue
+        messages.append(_make_message(
+            "", raw, row["confidence"], row["y"],
+            is_self=own_match, kind="bubble"))
+    return _finalize(messages, limit)
+
+
 # ===========================================================================
 # 面板是否打开的启发式
 # ===========================================================================
